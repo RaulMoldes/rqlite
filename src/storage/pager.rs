@@ -97,7 +97,7 @@ impl Pager {
         Ok(())
     }
 
-    /// Obtiene una página de la base de datos, cargándola desde disco si es necesario.
+    // Obtiene una página de la base de datos, cargándola desde disco si es necesario.
     ///
     /// # Parámetros
     /// * `page_number` - Número de página a obtener.
@@ -105,13 +105,7 @@ impl Pager {
     ///
     /// # Errores
     /// Retorna un error si la página no existe, no se puede leer, o si el tipo no coincide.
-    ///
-    /// # Genéricos
-    /// * `T` - Tipo de retorno específico, que debe ser derivable de `Page`.
-    pub fn get_page<T>(&mut self, page_number: u32, page_type: Option<PageType>) -> io::Result<&T>
-    where
-        T: From<Page> + Clone,
-    {
+    pub fn get_page(&mut self, page_number: u32, page_type: Option<PageType>) -> io::Result<&Page> {
         if !self.page_cache.contains_key(&page_number) {
             // Cargar la página desde disco
             self.load_page(page_number)?;
@@ -154,20 +148,72 @@ impl Pager {
         // Marcar la página como sucia (modificada)
         self.dirty = true;
         
-        // Convertir el tipo genérico y devolver una referencia mutable
-        let page = self.page_cache.get_mut(&page_number)
+        // Devolver la referencia a la página
+        self.page_cache.get(&page_number)
             .ok_or_else(|| io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Página no encontrada: {}", page_number),
-            ))?;
-        
-        let page_clone = page.clone();
-        let mut converted = T::from(page_clone);
-        
-        // Devolver una referencia mutable
-        Ok(converted.as_mut())
+            ))
     }
 
+    /// Obtiene una página mutable de la base de datos, cargándola desde disco si es necesario.
+    ///
+    /// # Parámetros
+    /// * `page_number` - Número de página a obtener.
+    /// * `page_type` - Tipo esperado de la página.
+    ///
+    /// # Errores
+    /// Retorna un error si la página no existe, no se puede leer, o si el tipo no coincide.
+    pub fn get_page_mut(&mut self, page_number: u32, page_type: Option<PageType>) -> io::Result<&mut Page> {
+        if !self.page_cache.contains_key(&page_number) {
+            // Cargar la página desde disco
+            self.load_page(page_number)?;
+        }
+        
+        // Verificar el tipo de la página si se especificó
+        if let Some(expected_type) = page_type {
+            match self.page_cache.get(&page_number) {
+                Some(Page::BTree(btree_page)) => {
+                    if btree_page.header.page_type != expected_type {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Tipo de página incorrecto: esperado {:?}, obtenido {:?}",
+                                expected_type, btree_page.header.page_type),
+                        ));
+                    }
+                },
+                Some(Page::Overflow(_)) => {
+                    if expected_type != PageType::Overflow {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Tipo de página incorrecto: esperado {:?}, obtenido Overflow",
+                                expected_type),
+                        ));
+                    }
+                },
+                Some(Page::Free(_)) => {
+                    if expected_type != PageType::Free {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Tipo de página incorrecto: esperado {:?}, obtenido Free",
+                                expected_type),
+                        ));
+                    }
+                },
+                None => unreachable!("La página debe estar en la caché en este punto"),
+            }
+        }
+        
+        // Marcar la página como sucia (modificada)
+        self.dirty = true;
+        
+        // Devolver la referencia mutable a la página
+        self.page_cache.get_mut(&page_number)
+            .ok_or_else(|| io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Página no encontrada: {}", page_number),
+            ))
+    }
     /// Carga una página desde el disco en la caché.
     ///
     /// # Parámetros
@@ -204,6 +250,7 @@ impl Pager {
         Ok(())
     }
 
+    
     /// Determina si una página es una página B-Tree.
     ///
     /// # Parámetros
@@ -590,7 +637,7 @@ mod tests {
         
         // Abrir un nuevo pager y verificar que la página es legible
         let mut pager2 = Pager::open(&db_path).unwrap();
-        let page_result = pager2.get_page::<BTreePage>(page_number, Some(PageType::TableLeaf));
+        let page_result = pager2.get_page(page_number, Some(PageType::TableLeaf));
         assert!(page_result.is_ok());
     }
 

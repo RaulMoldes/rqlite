@@ -20,7 +20,7 @@ pub enum PageType {
     /// Página de tabla hoja (Hoja del B-Tree de tabla)
     TableLeaf = 0x0D,
     /// Página de desbordamiento (almacena datos que no caben en una página)
-    Overflow = 0x00,
+    Overflow = 0x10,
     /// Página libre (no utilizada)
     Free = 0x00,
 }
@@ -33,7 +33,9 @@ impl PageType {
             0x05 => Some(PageType::TableInterior),
             0x0A => Some(PageType::IndexLeaf),
             0x0D => Some(PageType::TableLeaf),
-            _ => None, // No podemos distinguir automáticamente entre overflow y free
+            0x10 => Some(PageType::Overflow), // Añadido el caso para Overflow
+            0x00 => Some(PageType::Free),
+            _ => None, // No se puede distinguir automáticamente
         }
     }
 
@@ -552,6 +554,90 @@ impl Page {
             Page::BTree(page) => page.page_size,
             Page::Overflow(page) => page.page_size,
             Page::Free(page) => page.page_size,
+        }
+    }
+}
+
+// Implementaciones de From<Page> para los diferentes tipos de páginas
+impl From<Page> for BTreePage {
+    fn from(page: Page) -> Self {
+        match page {
+            Page::BTree(btree_page) => btree_page,
+            _ => panic!("No se puede convertir a BTreePage: la página no es de tipo BTree"),
+        }
+    }
+}
+
+impl From<Page> for OverflowPage {
+    fn from(page: Page) -> Self {
+        match page {
+            Page::Overflow(overflow_page) => overflow_page,
+            _ => panic!("No se puede convertir a OverflowPage: la página no es de tipo Overflow"),
+        }
+    }
+}
+
+impl From<Page> for FreePage {
+    fn from(page: Page) -> Self {
+        match page {
+            Page::Free(free_page) => free_page,
+            _ => panic!("No se puede convertir a FreePage: la página no es de tipo Free"),
+        }
+    }
+}
+
+// También necesitamos implementar From<Page> para las referencias a estos tipos
+impl<'a> From<&'a Page> for &'a BTreePage {
+    fn from(page: &'a Page) -> Self {
+        match page {
+            Page::BTree(btree_page) => btree_page,
+            _ => panic!("No se puede convertir a &BTreePage: la página no es de tipo BTree"),
+        }
+    }
+}
+
+impl<'a> From<&'a mut Page> for &'a mut BTreePage {
+    fn from(page: &'a mut Page) -> Self {
+        match page {
+            Page::BTree(btree_page) => btree_page,
+            _ => panic!("No se puede convertir a &mut BTreePage: la página no es de tipo BTree"),
+        }
+    }
+}
+
+// Implementaciones similares para OverflowPage y FreePage
+impl<'a> From<&'a Page> for &'a OverflowPage {
+    fn from(page: &'a Page) -> Self {
+        match page {
+            Page::Overflow(overflow_page) => overflow_page,
+            _ => panic!("No se puede convertir a &OverflowPage: la página no es de tipo Overflow"),
+        }
+    }
+}
+
+impl<'a> From<&'a mut Page> for &'a mut OverflowPage {
+    fn from(page: &'a mut Page) -> Self {
+        match page {
+            Page::Overflow(overflow_page) => overflow_page,
+            _ => panic!("No se puede convertir a &mut OverflowPage: la página no es de tipo Overflow"),
+        }
+    }
+}
+
+impl<'a> From<&'a Page> for &'a FreePage {
+    fn from(page: &'a Page) -> Self {
+        match page {
+            Page::Free(free_page) => free_page,
+            _ => panic!("No se puede convertir a &FreePage: la página no es de tipo Free"),
+        }
+    }
+}
+
+impl<'a> From<&'a mut Page> for &'a mut FreePage {
+    fn from(page: &'a mut Page) -> Self {
+        match page {
+            Page::Free(free_page) => free_page,
+            _ => panic!("No se puede convertir a &mut FreePage: la página no es de tipo Free"),
         }
     }
 }

@@ -1,4 +1,4 @@
-use sqlite_engine::{Database, btree::Record, utils::serialization::SqliteValue};
+use rqlite_engine::{Database, btree::Record, utils::serialization::SqliteValue};
 use std::{io, fs, path::Path};
 
 fn main() -> io::Result<()> {

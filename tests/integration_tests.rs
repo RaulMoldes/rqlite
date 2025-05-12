@@ -1,4 +1,4 @@
-use sqlite_engine::{Database, btree::Record, utils::serialization::SqliteValue};
+use rqlite_engine::{Database, btree::Record, utils::serialization::SqliteValue};
 use tempfile::tempdir;
 use std::io;
 
@@ -90,7 +90,7 @@ fn test_database_with_btree() -> io::Result<()> {
     
     // Recuperar la página raíz y abrir el árbol B-Tree
     let root_page = 2; // Asumimos que es la segunda página, en una implementación real habría un catálogo de tablas
-    let mut table = db.open_btree(root_page, sqlite_engine::btree::TreeType::Table)?;
+    let table = db.open_btree(root_page, rqlite_engine::btree::TreeType::Table)?;
     
     // Verificar que los registros siguen como esperamos después de reabrir
     assert!(table.find(25)?.is_none());

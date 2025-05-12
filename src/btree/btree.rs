@@ -5,12 +5,12 @@
 
 use std::io;
 
-use crate::page::{BTreePage, Page, PageType, BTreeCell, TableLeafCell, TableInteriorCell};
+use crate::page::{Page, PageType, BTreeCell};
 use crate::storage::Pager;
 use crate::btree::node::BTreeNode;
 use crate::btree::cell::BTreeCellFactory;
 use crate::btree::record::Record;
-use crate::utils::serialization::SqliteValue;
+
 
 /// Representa un árbol B-Tree de SQLite.
 ///
@@ -125,22 +125,8 @@ impl BTree {
         })
     }
 
-    /// Abre un árbol B-Tree existente.
-    ///
-    /// # Parámetros
-    /// * `root_page` - Número de página de la raíz del árbol.
-    /// * `tree_type` - Tipo de árbol (tabla o índice).
-    /// * `pager` - Pager para operaciones de I/O.
-    /// * `page_size` - Tamaño de página en bytes.
-    /// * `reserved_space` - Espacio reservado al final de cada página.
-    /// * `max_payload_fraction` - Fracción máxima de una página que puede ocupar una celda.
-    /// * `min_payload_fraction` - Fracción mínima de una página que debe ocupar una celda.
-    ///
-    /// # Errores
-    /// Retorna un error si la página raíz no existe o no es válida.
-    ///
-    /// # Seguridad
-    /// El pager debe ser válido durante toda la vida del árbol.
+    
+
     pub fn open(
         root_page: u32,
         tree_type: TreeType,
@@ -151,34 +137,56 @@ impl BTree {
         min_payload_fraction: u8,
     ) -> io::Result<Self> {
         // Verificar que la página raíz existe y es válida
-        let page_type = match tree_type {
+        match tree_type {
             TreeType::Table => {
                 // La raíz puede ser hoja o interior
-                match unsafe {
-                    let page = (*pager).get_page::<BTreePage>(root_page, None)?;
-                    page.header.page_type
-                } {
-                    PageType::TableLeaf | PageType::TableInterior => {},
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "La página raíz no es un nodo de tabla",
-                        ));
+                unsafe {
+                    let page = (*pager).get_page(root_page, None)?;
+                    
+                    match page {
+                        Page::BTree(btree_page) => {
+                            match btree_page.header.page_type {
+                                PageType::TableLeaf | PageType::TableInterior => {},
+                                _ => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "La página raíz no es un nodo de tabla",
+                                    ));
+                                }
+                            }
+                        },
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "La página raíz no es un nodo B-Tree",
+                            ));
+                        }
                     }
                 }
             },
             TreeType::Index => {
                 // La raíz puede ser hoja o interior
-                match unsafe {
-                    let page = (*pager).get_page::<BTreePage>(root_page, None)?;
-                    page.header.page_type
-                } {
-                    PageType::IndexLeaf | PageType::IndexInterior => {},
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "La página raíz no es un nodo de índice",
-                        ));
+                unsafe {
+                    let page = (*pager).get_page(root_page, None)?;
+                    
+                    match page {
+                        Page::BTree(btree_page) => {
+                            match btree_page.header.page_type {
+                                PageType::IndexLeaf | PageType::IndexInterior => {},
+                                _ => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "La página raíz no es un nodo de índice",
+                                    ));
+                                }
+                            }
+                        },
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "La página raíz no es un nodo B-Tree",
+                            ));
+                        }
                     }
                 }
             },
@@ -194,7 +202,7 @@ impl BTree {
             min_payload_fraction,
         })
     }
-
+    
     /// Obtiene el tamaño máximo de payload que puede almacenarse localmente.
     fn max_local_payload(&self) -> usize {
         let usable_size = self.page_size as usize - self.reserved_space as usize;
@@ -208,118 +216,137 @@ impl BTree {
     }
 
     /// Busca un registro en el árbol de tabla por su rowid.
-    ///
-    /// # Parámetros
-    /// * `rowid` - ID de la fila a buscar.
-    ///
-    /// # Errores
-    /// Retorna un error si el árbol no es de tabla o si hay problemas de I/O.
-    ///
-    /// # Retorno
-    /// El registro encontrado, o `None` si no existe.
-    pub fn find(&self, rowid: i64) -> io::Result<Option<Record>> {
-        if self.tree_type != TreeType::Table {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "El árbol no es de tabla",
-            ));
-        }
+///
+/// # Parámetros
+/// * `rowid` - ID de la fila a buscar.
+///
+/// # Errores
+/// Retorna un error si el árbol no es de tabla o si hay problemas de I/O.
+///
+/// # Retorno
+/// El registro encontrado, o `None` si no existe.
+pub fn find(&self, rowid: i64) -> io::Result<Option<Record>> {
+    if self.tree_type != TreeType::Table {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "El árbol no es de tabla",
+        ));
+    }
+    
+    // Empezar desde la raíz
+    let mut page_number = self.root_page;
+    let mut is_leaf = false;
+    let mut node_type = PageType::TableLeaf; // Valor por defecto, se actualizará enseguida
+    
+    // Determinar el tipo de nodo de la raíz
+    unsafe {
+        let page = (*self.pager).get_page(page_number, None)?;
         
-        // Empezar desde la raíz
-        let mut page_number = self.root_page;
-        let mut is_leaf = false;
-        
-        // Descender hasta una hoja
-        while !is_leaf {
-            // Abrir el nodo actual
-            let node = unsafe {
-                let page = (*self.pager).get_page::<BTreePage>(page_number, None)?;
-                is_leaf = page.header.page_type.is_leaf();
-                
-                if page.header.page_type == PageType::TableLeaf {
-                    BTreeNode::open(page_number, PageType::TableLeaf, self.pager)?
-                } else if page.header.page_type == PageType::TableInterior {
-                    BTreeNode::open(page_number, PageType::TableInterior, self.pager)?
-                } else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Tipo de página no válido para tabla",
-                    ));
-                }
-            };
-            
-            if !is_leaf {
-                // Nodo interior, buscar el hijo correspondiente
-                let (found, child_page, _) = node.find_table_key(rowid)?;
-                
-                if found {
-                    // Encontramos una celda con la clave exacta, pero en un nodo interior
-                    // Descender al hijo izquierdo
-                    page_number = child_page;
-                } else {
-                    // No encontramos una coincidencia exacta, descender al hijo adecuado
-                    page_number = child_page;
-                }
-            }
-        }
-        
-        // Estamos en una hoja, buscar el rowid
-        let leaf_node = BTreeNode::open(page_number, PageType::TableLeaf, self.pager)?;
-        let (found, idx) = leaf_node.find_table_rowid(rowid)?;
-        
-        if !found {
-            // No encontramos el rowid
-            return Ok(None);
-        }
-        
-        // Obtener la celda
-        let cell = leaf_node.get_cell(idx)?;
-        
-        match cell {
-            BTreeCell::TableLeaf(leaf_cell) => {
-                // Reconstruir el registro a partir de los datos de la celda
-                let mut payload = leaf_cell.payload.clone();
-                
-                // Si hay overflow, leer los datos adicionales
-                if let Some(overflow_page) = leaf_cell.overflow_page {
-                    let mut current_page = overflow_page;
-                    
-                    while current_page != 0 {
-                        // Leer la página de overflow
-                        let overflow = unsafe {
-                            let page = (*self.pager).get_page::<Page>(current_page, Some(PageType::Overflow))?;
-                            
-                            match page {
-                                Page::Overflow(overflow) => overflow,
-                                _ => {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "Tipo de página no válido para overflow",
-                                    ));
-                                }
-                            }
-                        };
-                        
-                        // Añadir los datos al payload
-                        payload.extend_from_slice(&overflow.data);
-                        
-                        // Pasar a la siguiente página
-                        current_page = overflow.next_page;
-                    }
-                }
-                
-                // Deserializar el registro
-                let (record, _) = Record::from_bytes(&payload)?;
-                Ok(Some(record))
+        match page {
+            Page::BTree(btree_page) => {
+                node_type = btree_page.header.page_type;
+                is_leaf = btree_page.header.page_type.is_leaf();
             },
             _ => {
-                Err(io::Error::new(
+                return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Tipo de celda no válido para tabla hoja",
-                ))
+                    "La página raíz no es un nodo B-Tree",
+                ));
             }
         }
     }
+    
+    // Descender hasta una hoja
+    while !is_leaf {
+        // Abrir el nodo actual
+        let node = BTreeNode::open(page_number, node_type, self.pager)?;
+        
+        // Buscar el hijo correspondiente
+        let (_, child_page, _) = node.find_table_key(rowid)?;
+        
+        // Descender al hijo adecuado
+        page_number = child_page;
+        
+        // Actualizar el tipo de nodo para el siguiente nivel
+        unsafe {
+            let page = (*self.pager).get_page(page_number, None)?;
+            
+            match page {
+                Page::BTree(btree_page) => {
+                    node_type = btree_page.header.page_type;
+                    is_leaf = btree_page.header.page_type.is_leaf();
+                },
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "La página no es un nodo B-Tree",
+                    ));
+                }
+            }
+        }
+    }
+    
+    // Estamos en una hoja, buscar el rowid
+    let leaf_node = BTreeNode::open(page_number, node_type, self.pager)?;
+    let (found, idx) = leaf_node.find_table_rowid(rowid)?;
+    
+    if !found {
+        // No encontramos el rowid
+        return Ok(None);
+    }
+    
+    // Obtener la celda
+    let cell = leaf_node.get_cell(idx)?;
+    
+    match cell {
+        BTreeCell::TableLeaf(leaf_cell) => {
+            // Reconstruir el registro a partir de los datos de la celda
+            let mut payload = leaf_cell.payload.clone();
+            
+            // Si hay overflow, leer los datos adicionales
+            if let Some(overflow_page) = leaf_cell.overflow_page {
+                let mut current_page = overflow_page;
+                
+                while current_page != 0 {
+                    // Leer la página de overflow
+                    let overflow_data = unsafe {
+                        let page = (*self.pager).get_page(current_page, Some(PageType::Overflow))?;
+                        
+                        match page {
+                            Page::Overflow(overflow) => {
+                                let next_page = overflow.next_page;
+                                let data = overflow.data.clone();
+                                (next_page, data)
+                            },
+                            _ => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "Tipo de página no válido para overflow",
+                                ));
+                            }
+                        }
+                    };
+                    
+                    // Añadir los datos al payload
+                    payload.extend_from_slice(&overflow_data.1);
+                    
+                    // Pasar a la siguiente página
+                    current_page = overflow_data.0;
+                }
+            }
+            
+            // Deserializar el registro
+            let (record, _) = Record::from_bytes(&payload)?;
+            Ok(Some(record))
+        },
+        _ => {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Tipo de celda no válido para tabla hoja",
+            ))
+        }
+    }
+}
 
     /// Inserta un registro en el árbol de tabla con el rowid especificado.
     ///
@@ -352,7 +379,6 @@ impl BTree {
             payload,
             max_local,
             min_local,
-            self.page_size,
             usable_size,
         )?;
         
@@ -443,63 +469,76 @@ impl BTree {
     }
 
     /// Encuentra el nodo hoja donde se debe insertar una celda con el rowid especificado.
-    ///
-    /// # Parámetros
-    /// * `rowid` - Rowid a buscar.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas de I/O.
-    ///
-    /// # Retorno
-    /// Tupla con el número de página del nodo hoja y el camino desde la raíz.
-    fn find_leaf_for_insert(&self, rowid: i64) -> io::Result<(u32, Vec<u32>)> {
-        // Empezar desde la raíz
-        let mut page_number = self.root_page;
-        let mut path = Vec::new();
-        let mut is_leaf = false;
+///
+/// # Parámetros
+/// * `rowid` - Rowid a buscar.
+///
+/// # Errores
+/// Retorna un error si hay problemas de I/O.
+///
+/// # Retorno
+/// Tupla con el número de página del nodo hoja y el camino desde la raíz.
+fn find_leaf_for_insert(&self, rowid: i64) -> io::Result<(u32, Vec<u32>)> {
+    // Empezar desde la raíz
+    let mut page_number = self.root_page;
+    let mut path = Vec::new();
+    let mut is_leaf = false;
+    let mut node_type = PageType::TableLeaf; // Valor inicial, se actualizará enseguida
+    
+    // Determinar el tipo del nodo raíz
+    unsafe {
+        let page = (*self.pager).get_page(page_number, None)?;
         
-        // Descender hasta una hoja
-        while !is_leaf {
-            // Añadir el nodo actual al camino
-            path.push(page_number);
-            
-            // Abrir el nodo actual
-            let node = unsafe {
-                let page = (*self.pager).get_page::<BTreePage>(page_number, None)?;
-                is_leaf = page.header.page_type.is_leaf();
-                
-                if page.header.page_type == PageType::TableLeaf {
-                    BTreeNode::open(page_number, PageType::TableLeaf, self.pager)?
-                } else if page.header.page_type == PageType::TableInterior {
-                    BTreeNode::open(page_number, PageType::TableInterior, self.pager)?
-                } else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Tipo de página no válido para tabla",
-                    ));
-                }
-            };
-            
-            if is_leaf {
-                break;
-            }
-            
-            // Nodo interior, buscar el hijo correspondiente
-            let (found, child_page, _) = node.find_table_key(rowid)?;
-            
-            if found {
-                // Encontramos una celda con la clave exacta, pero en un nodo interior
-                // Descender al hijo izquierdo
-                page_number = child_page;
-            } else {
-                // No encontramos una coincidencia exacta, descender al hijo adecuado
-                page_number = child_page;
+        match page {
+            Page::BTree(btree_page) => {
+                node_type = btree_page.header.page_type;
+                is_leaf = btree_page.header.page_type.is_leaf();
+            },
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "La página raíz no es un nodo B-Tree",
+                ));
             }
         }
-        
-        // Estamos en una hoja
-        Ok((page_number, path))
     }
+    
+    // Descender hasta una hoja
+    while !is_leaf {
+        // Añadir el nodo actual al camino
+        path.push(page_number);
+        
+        // Abrir el nodo actual
+        let node = BTreeNode::open(page_number, node_type, self.pager)?;
+        
+        // Buscar el hijo correspondiente
+        let (_, child_page, _) = node.find_table_key(rowid)?;
+        
+        // Descender al hijo adecuado
+        page_number = child_page;
+        
+        // Actualizar el tipo de nodo para el siguiente nivel
+        unsafe {
+            let page = (*self.pager).get_page(page_number, None)?;
+            
+            match page {
+                Page::BTree(btree_page) => {
+                    node_type = btree_page.header.page_type;
+                    is_leaf = btree_page.header.page_type.is_leaf();
+                },
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "La página no es un nodo B-Tree",
+                    ));
+                }
+            }
+        }
+    }
+    
+    // Estamos en una hoja
+    Ok((page_number, path))
+}
 
     /// Propaga la división de un nodo hacia arriba en el árbol.
     ///
@@ -577,94 +616,119 @@ impl BTree {
         )
     }
 
-    /// Elimina un registro del árbol de tabla por su rowid.
-    ///
-    /// # Parámetros
-    /// * `rowid` - ID de la fila a eliminar.
-    ///
-    /// # Errores
-    /// Retorna un error si el árbol no es de tabla o si hay problemas de I/O.
-    ///
-    /// # Retorno
-    /// `true` si se eliminó el registro, `false` si no existía.
-    pub fn delete(&mut self, rowid: i64) -> io::Result<bool> {
-        // Esta implementación es simplificada y no maneja todos los casos
-        // como la fusión de nodos cuando quedan muy pocos elementos.
+    // Elimina un registro del árbol de tabla por su rowid.
+///
+/// # Parámetros
+/// * `rowid` - ID de la fila a eliminar.
+///
+/// # Errores
+/// Retorna un error si el árbol no es de tabla o si hay problemas de I/O.
+///
+/// # Retorno
+/// `true` si se eliminó el registro, `false` si no existía.
+pub fn delete(&mut self, rowid: i64) -> io::Result<bool> {
+    // Esta implementación es simplificada y no maneja todos los casos
+    // como la fusión de nodos cuando quedan muy pocos elementos.
+    
+    if self.tree_type != TreeType::Table {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "El árbol no es de tabla",
+        ));
+    }
+    
+    // Empezar desde la raíz
+    let mut page_number = self.root_page;
+    let mut is_leaf = false;
+    let mut node_type = PageType::TableLeaf; // Valor por defecto, se actualizará enseguida
+    
+    // Determinar el tipo de nodo de la raíz
+    unsafe {
+        let page = (*self.pager).get_page(page_number, None)?;
         
-        if self.tree_type != TreeType::Table {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "El árbol no es de tabla",
-            ));
+        match page {
+            Page::BTree(btree_page) => {
+                node_type = btree_page.header.page_type;
+                is_leaf = btree_page.header.page_type.is_leaf();
+            },
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "La página raíz no es un nodo B-Tree",
+                ));
+            }
         }
+    }
+    
+    // Descender hasta una hoja
+    while !is_leaf {
+        // Abrir el nodo actual
+        let node = BTreeNode::open(page_number, node_type, self.pager)?;
         
-        // Empezar desde la raíz
-        let mut page_number = self.root_page;
-        let mut is_leaf = false;
+        // Buscar el hijo correspondiente
+        let (_, child_page, _) = node.find_table_key(rowid)?;
         
-        // Descender hasta una hoja
-        while !is_leaf {
-            // Abrir el nodo actual
-            let node = unsafe {
-                let page = (*self.pager).get_page::<BTreePage>(page_number, None)?;
-                is_leaf = page.header.page_type.is_leaf();
-                
-                if page.header.page_type == PageType::TableLeaf {
-                    BTreeNode::open(page_number, PageType::TableLeaf, self.pager)?
-                } else if page.header.page_type == PageType::TableInterior {
-                    BTreeNode::open(page_number, PageType::TableInterior, self.pager)?
-                } else {
+        // Descender al hijo adecuado
+        page_number = child_page;
+        
+        // Actualizar el tipo de nodo para el siguiente nivel
+        unsafe {
+            let page = (*self.pager).get_page(page_number, None)?;
+            
+            match page {
+                Page::BTree(btree_page) => {
+                    node_type = btree_page.header.page_type;
+                    is_leaf = btree_page.header.page_type.is_leaf();
+                },
+                _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "Tipo de página no válido para tabla",
+                        "La página no es un nodo B-Tree",
                     ));
-                }
-            };
-            
-            if !is_leaf {
-                // Nodo interior, buscar el hijo correspondiente
-                let (found, child_page, _) = node.find_table_key(rowid)?;
-                
-                if found {
-                    // Encontramos una celda con la clave exacta, pero en un nodo interior
-                    // Descender al hijo izquierdo
-                    page_number = child_page;
-                } else {
-                    // No encontramos una coincidencia exacta, descender al hijo adecuado
-                    page_number = child_page;
                 }
             }
         }
-        
-        // Estamos en una hoja, buscar el rowid
-        let leaf_node = BTreeNode::open(page_number, PageType::TableLeaf, self.pager)?;
-        let (found, idx) = leaf_node.find_table_rowid(rowid)?;
-        
-        if !found {
-            // No encontramos el rowid
-            return Ok(false);
-        }
-        
-        // Obtener la página
-        let page = unsafe {
-            (*self.pager).get_page_mut::<BTreePage>(page_number, Some(PageType::TableLeaf))?
-        };
-        
-        // Eliminar la celda
-        page.cells.remove(idx as usize);
-        page.header.cell_count -= 1;
-        
-        // En una implementación completa, habría que manejar la fusión de nodos
-        // cuando quedan muy pocos elementos
-        
-        Ok(true)
     }
+    
+    // Estamos en una hoja, buscar el rowid
+    let leaf_node = BTreeNode::open(page_number, node_type, self.pager)?;
+    let (found, idx) = leaf_node.find_table_rowid(rowid)?;
+    
+    if !found {
+        // No encontramos el rowid
+        return Ok(false);
+    }
+    
+    // Obtener la página para eliminar la celda
+    unsafe {
+        let page = (*self.pager).get_page_mut(page_number, Some(PageType::TableLeaf))?;
+        
+        match page {
+            Page::BTree(btree_page) => {
+                // Eliminar la celda
+                btree_page.cells.remove(idx as usize);
+                btree_page.header.cell_count -= 1;
+                
+                // En una implementación completa, habría que manejar la fusión de nodos
+                // cuando quedan muy pocos elementos
+            },
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "La página no es un nodo B-Tree de tabla hoja",
+                ));
+            }
+        }
+    }
+    
+    Ok(true)
+}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    
     use tempfile::tempdir;
     use crate::Database;
     use crate::utils::serialization::SqliteValue;

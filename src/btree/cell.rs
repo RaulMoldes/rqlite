@@ -6,7 +6,7 @@
 use std::io;
 
 use crate::page::{BTreeCell, TableLeafCell, TableInteriorCell, IndexLeafCell, IndexInteriorCell};
-use crate::utils::serialization::SqliteValue;
+
 
 /// Fábrica para crear celdas de B-Tree.
 ///
@@ -37,7 +37,7 @@ impl BTreeCellFactory {
         payload: Vec<u8>,
         max_local_payload: usize,
         min_local_payload: usize,
-        page_size: u32,
+        
         usable_size: usize,
     ) -> io::Result<(BTreeCell, Option<Vec<u8>>)> {
         let payload_size = payload.len();
@@ -270,11 +270,11 @@ mod tests {
         let payload = vec![1, 2, 3, 4, 5];
         let max_local = 100;
         let min_local = 32;
-        let page_size = 4096;
+       
         let usable_size = 4000;
         
         let (cell, overflow) = BTreeCellFactory::create_table_leaf_cell(
-            42, payload.clone(), max_local, min_local, page_size, usable_size
+            42, payload.clone(), max_local, min_local, usable_size
         ).unwrap();
         
         match cell {
@@ -295,14 +295,14 @@ mod tests {
         let payload = vec![0; 5000]; // Payload grande que no cabe en una celda
         let max_local = 1000;
         let min_local = 32;
-        let page_size = 4096;
+    
         let usable_size = 4000;
         
         let (cell, overflow) = BTreeCellFactory::create_table_leaf_cell(
-            42, payload.clone(), max_local, min_local, page_size, usable_size
+            42, payload.clone(), max_local, min_local, usable_size
         ).unwrap();
         
-        match cell {
+        match &cell {
             BTreeCell::TableLeaf(leaf_cell) => {
                 assert_eq!(leaf_cell.row_id, 42);
                 assert_eq!(leaf_cell.payload_size as usize, payload.len());

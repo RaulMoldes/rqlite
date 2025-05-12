@@ -5,7 +5,7 @@
 
 use std::io;
 
-use crate::page::{BTreePage, PageType, TableLeafCell, TableInteriorCell, IndexLeafCell, IndexInteriorCell, BTreeCell};
+use crate::page::{BTreePage, PageType, Page, BTreeCell};
 use crate::storage::Pager;
 
 /// Representa un nodo de un árbol B-Tree.
@@ -44,7 +44,92 @@ impl BTreeNode {
         }
     }
 
-    /// Crea un nuevo nodo B-Tree hoja.
+     /// Abre un nodo B-Tree existente.
+    ///
+    /// # Parámetros
+    /// * `page_number` - Número de página donde se almacena el nodo.
+    /// * `node_type` - Tipo esperado del nodo.
+    /// * `pager` - Referencia al pager para operaciones de I/O.
+    ///
+    /// # Errores
+    /// Retorna un error si la página no existe, no se puede leer, o si el tipo no coincide.
+    ///
+    /// # Seguridad
+    /// El pager debe ser válido durante toda la vida del nodo.
+    pub fn open(page_number: u32, node_type: PageType, pager: *mut Pager) -> io::Result<Self> {
+        // Verificar que la página existe y es del tipo correcto
+        unsafe {
+            let page = (*pager).get_page(page_number, Some(node_type))?;
+            
+            match page {
+                Page::BTree(btree_page) => {
+                    if btree_page.header.page_type != node_type {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Tipo de página incorrecto: esperado {:?}, obtenido {:?}",
+                                node_type, btree_page.header.page_type),
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "La página no es de tipo BTree",
+                    ));
+                }
+            }
+        }
+        
+        // Crear un nuevo nodo B-Tree con la página existente
+        Ok(BTreeNode {
+            page_number,
+            node_type,
+            pager,
+        })
+    }
+   
+    /// Obtiene el número de celdas en el nodo.
+    ///
+    /// # Errores
+    /// Retorna un error si hay problemas de I/O.
+    pub fn cell_count(&self) -> io::Result<u16> {
+        let page = self.get_page()?;
+        Ok(page.header.cell_count)
+    }
+
+    // Obtiene la página B-Tree asociada a este nodo.
+    ///
+    /// # Errores
+    /// Retorna un error si hay problemas de I/O.
+    fn get_page(&self) -> io::Result<&BTreePage> {
+        unsafe {
+            match (*self.pager).get_page(self.page_number, Some(self.node_type))? {
+                Page::BTree(btree_page) => Ok(btree_page),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "La página no es de tipo BTree",
+                )),
+            }
+        }
+    }
+
+    /// Obtiene la página B-Tree asociada a este nodo para modificación.
+    ///
+    /// # Errores
+    /// Retorna un error si hay problemas de I/O.
+    fn get_page_mut(&self) -> io::Result<&mut BTreePage> {
+        unsafe {
+            match (*self.pager).get_page_mut(self.page_number, Some(self.node_type))? {
+                Page::BTree(btree_page) => Ok(btree_page),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "La página no es de tipo BTree",
+                )),
+            }
+        }
+    }
+    
+    // Crea un nuevo nodo B-Tree hoja.
     ///
     /// # Parámetros
     /// * `node_type` - Tipo de nodo hoja (TableLeaf o IndexLeaf).
@@ -59,12 +144,96 @@ impl BTreeNode {
         if !node_type.is_leaf() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
+                format!("El tipo de página no es una hoja: {:?}", node_type),
+            ));
+        }
+        
+        let page_number = unsafe {
+            (*pager).create_btree_page(node_type, None)?
+        };
+        
+        Ok(BTreeNode {
+            page_number,
+            node_type,
+            pager,
+        })
+    }
+
+    /// Crea un nuevo nodo B-Tree interior.
+    ///
+    /// # Parámetros
+    /// * `node_type` - Tipo de nodo interior (TableInterior o IndexInterior).
+    /// * `right_most_page` - Número de página del hijo más a la derecha.
+    /// * `pager` - Referencia al pager para operaciones de I/O.
+    ///
+    /// # Errores
+    /// Retorna un error si no se puede crear la página o si el tipo no es interior.
+    ///
+    /// # Seguridad
+    /// El pager debe ser válido durante toda la vida del nodo.
+    pub fn create_interior(node_type: PageType, right_most_page: u32, pager: *mut Pager) -> io::Result<Self> {
+        if !node_type.is_interior() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("El tipo de página no es interior: {:?}", node_type),
+            ));
+        }
+        
+        let page_number = unsafe {
+            (*pager).create_btree_page(node_type, Some(right_most_page))?
+        };
+        
+        Ok(BTreeNode {
+            page_number,
+            node_type,
+            pager,
+        })
+    }
+
+    /// Obtiene una celda del nodo.
+    ///
+    /// # Parámetros
+    /// * `index` - Índice de la celda (comenzando desde 0).
+    ///
+    /// # Errores
+    /// Retorna un error si el índice está fuera de rango o si hay problemas de I/O.
+    ///
+    /// # Retorno
+    /// Referencia a la celda.
+    pub fn get_cell(&self, index: u16) -> io::Result<&BTreeCell> {
+        let page = self.get_page()?;
+        
+        if index >= page.header.cell_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
                 format!("Índice de celda fuera de rango: {}, máximo {}", index, page.header.cell_count - 1),
             ));
         }
         
-        let cells = &mut page.cells;
-        Ok(&mut cells[index as usize])
+        Ok(&page.cells[index as usize])
+    }
+
+    /// Obtiene una celda del nodo para modificación.
+    ///
+    /// # Parámetros
+    /// * `index` - Índice de la celda (comenzando desde 0).
+    ///
+    /// # Errores
+    /// Retorna un error si el índice está fuera de rango o si hay problemas de I/O.
+    ///
+    /// # Retorno
+    /// Referencia mutable a la celda.
+    pub fn get_cell_mut(&self, index: u16) -> io::Result<&mut BTreeCell> {
+        let page = self.get_page_mut()?;
+        
+        if index >= page.header.cell_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Índice de celda fuera de rango: {}, máximo {}", index, page.header.cell_count - 1),
+            ));
+        }
+        
+        Ok(&mut page.cells[index as usize])
     }
 
     /// Inserta una celda en el nodo.
@@ -335,6 +504,18 @@ impl BTreeNode {
                 
                 BTreeNode::create_interior(self.node_type, mid_cell.left_child_page, self.pager)?
             },
+            PageType::Free => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "No se puede dividir un nodo de tipo Free",
+                ));
+            },
+            PageType::Overflow => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "No se puede dividir un nodo de tipo Overflow",
+                ));
+            },
         };
         
         // Mover las celdas después del punto de división al nuevo nodo
@@ -514,6 +695,8 @@ impl BTreeNode {
         
         Ok((false, None, None))
     }
+
+
 }
 
 #[cfg(test)]
