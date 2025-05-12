@@ -428,10 +428,14 @@ impl BTreeNode {
         // Búsqueda binaria
         let mut left = 0;
         let mut right = cell_count.saturating_sub(1) as i32;
-        
+        print!("Buscando rowid {} en el nodo hoja: ", rowid);
+        println!("Número de celdas: {}", cell_count);
+        println!("left: {}, right: {}", left, right);
         while left <= right {
             let mid = left + (right - left) / 2;
+            println!("mid: {}", mid);
             let mid_idx = mid as u16;
+            
             
             let cell = &page.cells[mid as usize];
             let mid_rowid = match cell {
@@ -618,12 +622,15 @@ impl BTreeNode {
                 ));
             }
         }
-        
+        println!("Insertando celda: {:?}", cell);
         let page = self.get_page_mut()?;
-        
+        println!("Página antes de la inserción: {:?}", page);
         // Verificar si hay suficiente espacio para la celda
         let cell_size = cell.size();
+        print!("Espacio libre en la página: {}", page.free_space());
+        println!("Tamaño de la celda: {}", cell_size);
         if page.free_space() < cell_size + 2 { // 2 bytes para el índice de la celda
+            println!("No hay suficiente espacio, dividiendo el nodo");
             // No hay suficiente espacio, dividir el nodo
             let (new_node, median_key, _) = self.split(None)?;
             
@@ -647,22 +654,31 @@ impl BTreeNode {
                 _ => unreachable!("Tipo de celda incorrecto"),
             };
             
+            
             if insert_in_new {
+                println!("Insertando en el nuevo nodo:");
                 // Insertar en el nuevo nodo
                 new_node.insert_cell_ordered(cell)?;
             } else {
+                println!("Insertando en el nodo original");
                 // Insertar en el nodo original
                 self.insert_cell_ordered(cell)?;
             }
             
             return Ok((true, Some(median_key), Some(new_node)));
         }
-        
+        println!("Hay suficiente espacio, insertando en el nodo correcto");
         // Hay suficiente espacio, insertar la celda en la posición correcta
         let position = match (&self.node_type, &cell) {
             (PageType::TableLeaf, BTreeCell::TableLeaf(table_cell)) => {
-                let (_, pos) = self.find_table_rowid(table_cell.row_id)?;
-                pos
+                println!("Buscando posición para la celda de tabla hoja");
+                if page.header.cell_count == 0 {
+                    // Si el array de celdas está vacío, insertar en la posición 0
+                    0
+                } else {
+                    let (_, pos) = self.find_table_rowid(table_cell.row_id)?;
+                    pos
+                }
             },
             (PageType::TableInterior, BTreeCell::TableInterior(table_cell)) => {
                 let (found, _, pos) = self.find_table_key(table_cell.key)?;

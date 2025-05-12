@@ -434,12 +434,15 @@ impl BTreePage {
     pub fn free_space(&self) -> usize {
         let header_size = self.header.size();
         let cell_indices_size = self.cell_indices.len() * 2; // 2 bytes por índice
-        
+        println!("Header size: {}", header_size);
+        println!("Cell indices size: {}", cell_indices_size);
         let used_space = if self.page_number == 1 {
             HEADER_SIZE + header_size + cell_indices_size
+            
         } else {
             header_size + cell_indices_size
         };
+        println!("Used space: {}", used_space);
         
         let content_size = self.page_size as usize - self.header.content_start_offset as usize;
         
