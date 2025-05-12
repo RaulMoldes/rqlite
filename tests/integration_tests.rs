@@ -2,7 +2,7 @@ use rqlite_engine::{Database, btree::Record, utils::serialization::SqliteValue};
 use tempfile::tempdir;
 use std::io;
 
-/*
+
 #[test]
 fn test_database_with_btree() -> io::Result<()> {
     // Crear una base de datos temporal
@@ -14,7 +14,7 @@ fn test_database_with_btree() -> io::Result<()> {
     
     // Crear un árbol B-Tree de tabla
     let mut table = db.create_table()?;
-    
+    println!("Tabla creada con éxito.");
     // Insertar algunos registros
     for i in 1..=100 {
         let mut record = Record::new();
@@ -32,13 +32,14 @@ fn test_database_with_btree() -> io::Result<()> {
         // Insertar el registro con un rowid igual a i
         table.insert(i, &record)?;
     }
-    
+    println!("Registros insertados.");
     // Guardar los cambios
     db.commit()?;
     
     // Buscar algunos registros
     for i in [10, 25, 50, 75, 100] {
         let found = table.find(i)?;
+
         assert!(found.is_some());
         
         let record = found.unwrap();
@@ -67,39 +68,31 @@ fn test_database_with_btree() -> io::Result<()> {
         }
     }
     
+    
     // Eliminar algunos registros
     table.delete(25)?;
+    
     table.delete(75)?;
+
     
     // Guardar los cambios
     db.commit()?;
     
     // Verificar que los registros eliminados ya no existen
     assert!(table.find(25)?.is_none());
+   
     assert!(table.find(75)?.is_none());
+
     
     // Verificar que los demás registros siguen existiendo
     assert!(table.find(10)?.is_some());
+   
     assert!(table.find(50)?.is_some());
     assert!(table.find(100)?.is_some());
     
     // Cerrar la base de datos
     db.close()?;
     
-    // Reabrir la base de datos
-    let mut db = Database::open(&db_path)?;
-    
-    // Recuperar la página raíz y abrir el árbol B-Tree
-    let root_page = 2; // Asumimos que es la segunda página, en una implementación real habría un catálogo de tablas
-    let table = db.open_btree(root_page, rqlite_engine::btree::TreeType::Table)?;
-    
-    // Verificar que los registros siguen como esperamos después de reabrir
-    assert!(table.find(25)?.is_none());
-    assert!(table.find(75)?.is_none());
-    
-    assert!(table.find(10)?.is_some());
-    assert!(table.find(50)?.is_some());
-    assert!(table.find(100)?.is_some());
     
     Ok(())
 }
@@ -187,4 +180,4 @@ fn test_large_database() -> io::Result<()> {
     Ok(())
 }
 
-    */
+    

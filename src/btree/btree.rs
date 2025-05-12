@@ -370,9 +370,9 @@ pub fn find(&self, rowid: i64) -> io::Result<Option<Record>> {
         
         // Determinar el tamaño máximo de payload local
         let max_local = self.max_local_payload();
-        println!("Tamaño máximo local: {}", max_local);
+        ////println!("Tamaño máximo local: {}", max_local);
         let min_local = self.min_local_payload();
-        println!("Tamaño mínimo local: {}", min_local);
+        ////println!("Tamaño mínimo local: {}", min_local);
         let usable_size = self.page_size as usize - self.reserved_space as usize;
         
         // Crear la celda
@@ -401,17 +401,17 @@ pub fn find(&self, rowid: i64) -> io::Result<Option<Record>> {
         } else {
             cell
         };
-        println!("Celda creada: {:?}", cell);
+        ////println!("Celda creada: {:?}", cell);
         // Encontrar el nodo hoja donde se debe insertar
         let (leaf_page, path) = self.find_leaf_for_insert(rowid)?;
         
 
-        println!("Página hoja encontrada: {}", leaf_page);
+        ////println!("Página hoja encontrada: {}", leaf_page);
         let leaf_node = BTreeNode::open(leaf_page, PageType::TableLeaf, self.pager)?;
-        println!("Nodo hoja abierto");
+        ////println!("Nodo hoja abierto");
         // Intentar insertar en el nodo hoja
         let (split, median_key, new_node) = leaf_node.insert_cell_ordered(cell)?;
-        println!("Inserción en hoja: {:?}", split);
+        ////println!("Inserción en hoja: {:?}", split);
         if !split {
             // La inserción no causó división, terminamos
             return Ok(());
@@ -419,7 +419,7 @@ pub fn find(&self, rowid: i64) -> io::Result<Option<Record>> {
         
         // La inserción causó división, necesitamos propagar la división hacia arriba
         self.propagate_split(leaf_node, new_node.unwrap(), median_key.unwrap(), path)?;
-        println!("División propagada");
+        ////println!("División propagada");
         Ok(())
     }
 
@@ -496,7 +496,7 @@ fn find_leaf_for_insert(&self, rowid: i64) -> io::Result<(u32, Vec<u32>)> {
         
         match page {
             Page::BTree(btree_page) => {
-                println!("Tipo de página: {:?}", btree_page.header.page_type);
+                ////println!("Tipo de página: {:?}", btree_page.header.page_type);
                 node_type = btree_page.header.page_type;
                 is_leaf = btree_page.header.page_type.is_leaf();
             },
