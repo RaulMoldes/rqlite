@@ -654,7 +654,8 @@ mod tests {
         assert_eq!(PageType::from_byte(0x05), Some(PageType::TableInterior));
         assert_eq!(PageType::from_byte(0x0A), Some(PageType::IndexLeaf));
         assert_eq!(PageType::from_byte(0x0D), Some(PageType::TableLeaf));
-        assert_eq!(PageType::from_byte(0x00), None); // No se puede distinguir automáticamente
+        assert_eq!(PageType::from_byte(0x10), Some(PageType::Overflow));
+        assert_eq!(PageType::from_byte(0x00), Some(PageType::Free)); 
     }
 
     #[test]

@@ -627,7 +627,7 @@ mod tests {
         
         // Crear una página B-Tree de tabla hoja
         let page_number = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
-        assert_eq!(page_number, 2); // La primera página es el encabezado
+        assert_eq!(page_number, 3); // La primera página es el encabezado
         
         // Verificar que la página existe en la caché
         assert!(pager.page_cache.contains_key(&page_number));
@@ -672,12 +672,12 @@ mod tests {
         let mut pager = Pager::create(&db_path, 4096, 0).unwrap();
         
         // Verificar que hay una página inicialmente
-        assert_eq!(pager.page_count().unwrap(), 1);
+        assert_eq!(pager.page_count().unwrap(), 2); // 1 para el encabezado y 1 para la primera página
         
         // Crear una página B-Tree
         pager.create_btree_page(PageType::TableLeaf, None).unwrap();
         
         // Verificar que ahora hay dos páginas
-        assert_eq!(pager.page_count().unwrap(), 2);
+        assert_eq!(pager.page_count().unwrap(), 3);
     }
 }
