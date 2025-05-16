@@ -1,65 +1,91 @@
 //! # VarInt Module
 //! 
-//! Este módulo implementa la codificación y decodificación de enteros de longitud variable
-//! (varint) utilizados en el formato de archivo SQLite.
+//! This module implements encoding and decoding of variable-length integers
+//! (varint) used in the SQLite file format.
 //! 
-//! Los varints son una forma de codificar enteros que utiliza menos bytes para valores pequeños,
-//! lo que ahorra espacio en el archivo de base de datos.
+//! 
+//! Varint is a method of encoding integers using a variable number of bytes.
+//! It is commonly used in databases and serialization formats to save space.
+//!
 
 use std::io::{self, Read, Write};
 
-/// Tamaño máximo en bytes que puede ocupar un varint.
+/// MAX SIZE FOR A VARINT. A varint occupies 8 bytes for values up to 2^56 - 1.
+/// For values larger than this, it occupies 9 bytes.
+/// The maximum value that can be represented in 8 bytes is 2^56 - 1.
+/// The 9th byte is used to store the sign bit of the 64-bit integer.
+/// The maximum value that can be represented in 9 bytes is 2^64 - 1.
 pub const MAX_VARINT_SIZE: usize = 9;
 
-/// Codifica un entero de 64 bits con signo en formato varint.
+
+/// Encodes a signed 64-bit integer as a varint.
 ///
-/// # Parámetros
-/// * `value` - El valor a codificar.
-/// * `writer` - Destino donde se escribirá el valor codificado.
-///
-/// # Errores
-/// Retorna un error si hay problemas al escribir en el destino.
-///
-/// # Retorno
-/// Número de bytes escritos.
+/// # Parameters
+/// * `value` - The signed integer to encode.
+/// * `writer` - The destination where the encoded bytes will be written (must implement `Write`).
+/// 
+/// # Errors
+/// Returns an error if there are issues writing to the destination.
+/// 
+/// # Returns
+/// The number of bytes written to the destination.
 pub fn encode_varint<W: Write>(value: i64, writer: &mut W) -> io::Result<usize> {
     let mut uvalue = value as u64;
+
+    // Initialize the number of bytes written
+    // to 0. This will be updated as we write bytes.
     let mut bytes_written = 0;
     
-    // Para valores pequeños (0-127), usar un solo byte
+    // For small values (1 byte)
+    // If the value is less than or equal to 127, we can write it directly.
+    // The first bit is the sign bit, so we can use the lower 7 bits.
     if uvalue <= 0x7F {
         writer.write_all(&[uvalue as u8])?;
         return Ok(1);
     }
     
-    // Para valores que caben en 8 bytes
+    // For larger values, we need to encode them in multiple bytes.
+    // THis is the case for values that are larger than 127, but can be fit in 8 bytes.
+    // We will use the first 7 bits of each byte to store the value, and the 8th bit
+    // as a continuation bit. The continuation bit is set to 1 if there are more bytes
+    // to read, and 0 if this is the last byte.
     if uvalue <= 0xFFFFFFFFFFFFFF {
         let mut buffer = [0u8; 8];
         let mut i = 0;
         
-        // Codificar 7 bits por byte, con el bit más significativo como indicador
-        while uvalue >= 0x80 {
+        // Encode the value in 7-bit chunks
+        // The first 7 bits are stored in the first byte, the next 7 bits in the second byte, and so on.
+        // The last byte will not have the continuation bit set.
+        while uvalue >= 0x80 { // While there are more than 7 bits to encode
+            // Set the continuation bit (0x80) and store the lower 7 bits
+            // The lower 7 bits are obtained by ANDing with 0x7F (127 in decimal). (01111111)
+            // The continuation bit is set by ORing with 0x80 (128 in decimal). (10000000)
+            // The value is then shifted right by 7 bits to process the next chunk.
+            // The first byte will have the continuation bit set, and the lower 7 bits of the value.
             buffer[i] = 0x80 | (uvalue & 0x7F) as u8;
             uvalue >>= 7;
             i += 1;
         }
         
-        // Último byte sin bit indicador
+        // The last byte will not have the continuation bit set.
         buffer[i] = uvalue as u8;
         
-        // Escribir los bytes utilizados
+        // Write the buffer to the destination.
         writer.write_all(&buffer[0..=i])?;
         bytes_written = i + 1;
     } else {
-        // Para valores que requieren 9 bytes
+        // For values larger than 8 bytes, we need to use 9 bytes.
+        // The first 8 bytes will have the continuation bit set, and the last byte will not.
+        // The last byte will contain the sign bit of the 64-bit integer.
         let mut buffer = [0u8; 9];
         
-        // Los primeros 8 bytes tienen el bit más significativo activo
+        // The first 8 bytes will have the continuation bit set.
+        // The first 7 bits are stored in the first byte, the next 7 bits in the second byte, and so on.
         for i in 0..8 {
             buffer[i] = 0x80 | ((uvalue >> (7 * i)) & 0x7F) as u8;
         }
         
-        // El noveno byte contiene el último bit
+        // The last byte will not have the continuation bit set.
         buffer[8] = (uvalue >> 56) as u8;
         
         writer.write_all(&buffer)?;
@@ -69,64 +95,80 @@ pub fn encode_varint<W: Write>(value: i64, writer: &mut W) -> io::Result<usize> 
     Ok(bytes_written)
 }
 
-/// Decodifica un entero de 64 bits con signo en formato varint.
+/// Decodes a varint from a source. The source must implement the `Read` trait.
+/// # Parameters
+/// * `reader` - The source from which the varint will be read.
+/// 
+/// # Returns
+/// A tuple containing the decoded signed integer and the number of bytes read.
+/// 
+/// # Errors
+/// Returns an error if the varint is invalid or if there are issues reading from the source.
 ///
-/// # Parámetros
-/// * `reader` - Origen de datos que implementa `Read`.
-///
-/// # Errores
-/// Retorna un error si hay problemas al leer los datos o si el varint no es válido.
-///
-/// # Retorno
-/// Tupla con el valor decodificado y el número de bytes leídos.
 pub fn decode_varint<R: Read>(reader: &mut R) -> io::Result<(i64, usize)> {
+    // Initialize the result to 0, the shift to 0, and the number of bytes read to 0.
+    // The result will be a 64-bit unsigned integer, but we will return it as a signed integer.
+    // The shift will be used to shift the bits to the correct position.
+    // The number of bytes read will be used to keep track of how many bytes we have read.
     let mut result: u64 = 0;
     let mut shift: u32 = 0;
     let mut bytes_read = 0;
     
-    for _ in 0..MAX_VARINT_SIZE {
+    for _ in 0..MAX_VARINT_SIZE { // Till 9 bytes
+        // Read the first byte from the source.
+        // The first byte will have the continuation bit set if there are more bytes to read.
         let mut byte = [0u8; 1];
         reader.read_exact(&mut byte)?;
         bytes_read += 1;
         
-        // Extraer 7 bits de datos
+        // Extract the lower 7 bits from the byte and shift them to the correct position.
+        // The lower 7 bits are obtained by ANDing with 0x7F (127 in decimal).
+        // Then we shift the value to the left by the number of bits we have already read.
+        
         let value = (byte[0] & 0x7F) as u64;
         result |= value << shift;
         
-        // Si el bit más significativo no está activo, este es el último byte
+        // If the continuation bit is not set, we can stop reading.
+        // The continuation bit is the 8th bit of the byte, which is obtained by ANDing with 0x80 (128 in decimal).
         if byte[0] & 0x80 == 0 {
             return Ok((result as i64, bytes_read));
         }
         
-        // Cada byte aporta 7 bits
+        // If the continuation bit is set, we need to read the next byte.
+        // We shift the value to the left by 7 bits to make room for the next byte.
         shift += 7;
         
-        // Para el último byte (9º), no usamos el bit indicador
+        // For the ninth byte, we need to check if it is the last byte.
+        // The last byte will not have the continuation bit set, and it will contain the sign bit of the 64-bit integer.
+        // The last byte will be shifted 56 bits (8 bytes * 7 bits) to the left.
         if bytes_read == 8 {
             let mut last_byte = [0u8; 1];
             reader.read_exact(&mut last_byte)?;
             bytes_read += 1;
             
-            // El último byte se desplaza 56 bits (8 bytes * 7 bits)
+            // Shift the last byte to the left by 56 bits and add it to the result.
             result |= (last_byte[0] as u64) << 56;
             return Ok((result as i64, bytes_read));
         }
     }
     
-    // No debería llegar aquí, pero por si acaso
+    // Return an error if we have read 9 bytes and the continuation bit is still set.
+    // This means that the varint is invalid or too long.
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
-        "Varint inválido o demasiado largo",
+        "Too many bytes read for varint",
     ))
 }
 
-/// Calcula el tamaño en bytes que ocuparía un valor codificado como varint.
+/// Helpers to calculate the size of a varint.
+/// This function calculates the size of a varint for a given signed integer.
+/// The size is determined by the number of bytes needed to encode the integer.
+/// # Parameters
+/// * `value` - The signed integer to calculate the size for.
 ///
-/// # Parámetros
-/// * `value` - El valor para el que se calculará el tamaño.
-///
-/// # Retorno
-/// El número de bytes que ocuparía el valor codificado.
+/// # Returns
+/// The size of the varint in bytes.
+
 pub fn varint_size(value: i64) -> usize {
     let uvalue = value as u64;
     

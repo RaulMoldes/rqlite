@@ -1,42 +1,53 @@
 //! # Pager Module
 //! 
-//! Este módulo implementa el sistema de paginación que permite cargar y gestionar
-//! páginas de la base de datos en memoria.
-
+//! This module implements the `Pager` struct, which is responsible for managing
+//! the loading and caching of database pages. It interacts with the `DiskManager`
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Cursor};
 use std::path::Path;
+
 
 use super::disk::DiskManager;
 use crate::page::{BTreePage, BTreePageHeader, OverflowPage, FreePage, Page, PageType};
 use crate::header::Header;
 
-/// Gestiona la carga y caché de páginas de la base de datos.
-///
-/// El Pager actúa como intermediario entre el sistema de almacenamiento y el
-/// motor de base de datos, gestionando qué páginas están en memoria y sincronizando
-/// los cambios con el disco.
+/// Handles the loading and caching of database pages.
+/// Maintains a buffer pool of pages in memory and manages the interaction with the disk.
+/// It is responsible for reading and writing pages to and from the disk, as well as
+/// managing the page cache.
+/// The `Pager` struct is the main interface for interacting with the database pages.
+/// I decided to implement the page_cache as a HashMap instead of making some kind of 
+/// BufferPool, because the pages are not going to be used in a LRU-K way.
+/// To keep it simple, the pages are going to be used in a FIFO way, so a HashMap facilitates that.
+/// The `Pager` struct is the main interface for interacting with the database pages.
 pub struct Pager {
-    /// Gestor de operaciones de disco.
+    /// Disk manager.
     disk_manager: DiskManager,
-    /// Caché de páginas cargadas.
+    /// Page Cache. This should be a BufferPool, but for now it is just a HashMap.
     page_cache: HashMap<u32, Page>,
-    /// Tamaño de página en bytes.
+    /// Size of each page in bytes.
+    /// This is the size of the page that is going to be used in the database.
     page_size: u32,
-    /// Espacio reservado al final de cada página.
+    /// Reserved space at the end of each page.
     reserved_space: u8,
-    /// Indica si hay cambios pendientes que necesitan ser escritos a disco.
+    /// Indicates if the pager has unsaved changes. That must be written to disk.
+    /// Tis could be handled in a more fine-grained way when the BufferPool is implemented.
+    /// For now, if the Pager has any dirty page, all its cached pages must be written to disk.
     dirty: bool,
 }
 
 impl Pager {
-    /// Abre un archivo de base de datos existente.
-    ///
-    /// # Parámetros
-    /// * `path` - Ruta al archivo de base de datos.
-    ///
-    /// # Errores
-    /// Retorna un error si el archivo no existe, no se puede abrir, o no es un archivo SQLite válido.
+    /// Opens an existing database file.
+    /// Basically the same as `DiskManager::open`, but it also initializes the page cache.
+    /// 
+    /// # Parameters
+    /// * `path` - Path to the database file.
+    /// 
+    /// # Errors
+    /// Returns an error if the file cannot be opened or if the header is invalid.
+    /// 
+    /// # Returns
+    /// A `Pager` instance with the disk manager and page cache initialized.
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let mut disk_manager = DiskManager::open(path)?;
         let header = disk_manager.read_header()?;
@@ -50,19 +61,22 @@ impl Pager {
         })
     }
 
-    /// Crea un nuevo archivo de base de datos.
+    /// Creates a new database file.
+    /// 
+    /// # Parameters
+    /// * `path` - Path to the database file.
+    /// * `page_size` - Size of each page in bytes.
+    /// * `reserved_space` - Reserved space at the end of each page.
+    /// 
+    /// # Errors
+    /// Returns an error if the file cannot be created or if the header is invalid.
     ///
-    /// # Parámetros
-    /// * `path` - Ruta donde crear el archivo.
-    /// * `page_size` - Tamaño de página en bytes.
-    /// * `reserved_space` - Espacio reservado al final de cada página.
-    ///
-    /// # Errores
-    /// Retorna un error si no se puede crear el archivo o escribir en él.
+    /// # Returns
+    /// A `Pager` instance with the disk manager and page cache initialized.
     pub fn create<P: AsRef<Path>>(path: P, page_size: u32, reserved_space: u8) -> io::Result<Self> {
         let mut disk_manager = DiskManager::create(path, page_size)?;
         
-        // Actualizar el encabezado con el espacio reservado
+        // Upadate the header with the reserved space
         let mut header = disk_manager.read_header()?;
         header.reserved_space = reserved_space;
         disk_manager.write_header(&header)?;
@@ -76,49 +90,56 @@ impl Pager {
         })
     }
 
-    /// Obtiene el encabezado de la base de datos.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al leer los datos o si el encabezado no es válido.
+    /// Obtains the header of the database from the disk manager. 
     pub fn get_header(&mut self) -> io::Result<Header> {
         self.disk_manager.read_header()
     }
 
-    /// Actualiza el encabezado de la base de datos.
+    /// Updates the header of the database in the disk manager.
+    /// 
+    /// # Parameters
+    /// * `header` - Header to update.
     ///
-    /// # Parámetros
-    /// * `header` - Nuevo encabezado.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al escribir los datos.
+    /// # Errors
+    /// Returns an error if the header cannot be written to disk.
+    /// 
+    /// # Returns
+    /// A result indicating success or failure.
     pub fn update_header(&mut self, header: &Header) -> io::Result<()> {
         self.disk_manager.write_header(header)?;
-        self.dirty = true;
+        self.dirty = true; // Not really needed i think, but let's keep it for consistency
         Ok(())
     }
 
-    // Obtiene una página de la base de datos, cargándola desde disco si es necesario.
-    ///
-    /// # Parámetros
-    /// * `page_number` - Número de página a obtener.
-    /// * `page_type` - Tipo esperado de la página.
-    ///
-    /// # Errores
-    /// Retorna un error si la página no existe, no se puede leer, o si el tipo no coincide.
+    /// Obtains a page from the database, loading it from disk if necessary.
+    /// Attempts to load the page from the cache first, and if it is not found,
+    /// it loads it from disk and caches it.
+    /// 
+    /// # Parameters
+    /// * `page_number` - Number of the page to obtain.
+    /// * `page_type` - Expected type of the page.
+    /// 
+    /// # Errors
+    /// Returns an error if the page does not exist, cannot be read, or if the type does not match.
+    /// 
+    /// # Returns
+    /// A reference to the page.
     pub fn get_page(&mut self, page_number: u32, page_type: Option<PageType>) -> io::Result<&Page> {
         if !self.page_cache.contains_key(&page_number) {
-            // Cargar la página desde disco
+            // If it is not in the cache, load it from disk
+            // This is a bit tricky, because we need to check if the page exists
+            // and if it is a valid page. If it is not, we need to return an error.
             self.load_page(page_number)?;
         }
         
-        // Verificar el tipo de la página si se especificó
+        // Verifiy the type of the page if it was specified
         if let Some(expected_type) = page_type {
             match self.page_cache.get(&page_number) {
                 Some(Page::BTree(btree_page)) => {
                     if btree_page.header.page_type != expected_type {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("Tipo de página incorrecto: esperado {:?}, obtenido {:?}",
+                            format!("Type of page not supported: expected {:?}, obtained {:?}",
                                 expected_type, btree_page.header.page_type),
                         ));
                     }
@@ -127,7 +148,7 @@ impl Pager {
                     if expected_type != PageType::Overflow {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("Tipo de página incorrecto: esperado {:?}, obtenido Overflow",
+                            format!("Type of page not supported: expected {:?}, obtained Overflow",
                                 expected_type),
                         ));
                     }
@@ -136,48 +157,52 @@ impl Pager {
                     if expected_type != PageType::Free {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("Tipo de página incorrecto: esperado {:?}, obtenido Free",
+                            format!("Type of page not supported: expected {:?}, obtained Free",
                                 expected_type),
                         ));
                     }
                 },
-                None => unreachable!("La página debe estar en la caché en este punto"),
+                None => unreachable!("The page should be in the cache at this point!"),
             }
         }
         
-        // Marcar la página como sucia (modificada)
-        self.dirty = true;
+        // Mark the page as dirty (modified)
+        self.dirty = true; // ?? Not sure of this. It can be improved when the BufferPool is implemented
         
-        // Devolver la referencia a la página
+        // Return the reference to the page
         self.page_cache.get(&page_number)
             .ok_or_else(|| io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("Página no encontrada: {}", page_number),
+                format!("Page not found: {}", page_number),
             ))
     }
 
-    /// Obtiene una página mutable de la base de datos, cargándola desde disco si es necesario.
-    ///
-    /// # Parámetros
-    /// * `page_number` - Número de página a obtener.
-    /// * `page_type` - Tipo esperado de la página.
-    ///
-    /// # Errores
-    /// Retorna un error si la página no existe, no se puede leer, o si el tipo no coincide.
+    /// Similar to `get_page`, but returns a mutable reference to the page.
+    /// This is useful for modifying the page in place.
+    /// 
+    /// # Parameters
+    /// * `page_number` - Number of the page to obtain.
+    /// * `page_type` - Expected type of the page.
+    /// 
+    /// # Errors
+    /// Returns an error if the page does not exist, cannot be read, or if the type does not match.
+    /// 
+    /// # Returns
+    /// A mutable reference to the page.
     pub fn get_page_mut(&mut self, page_number: u32, page_type: Option<PageType>) -> io::Result<&mut Page> {
         if !self.page_cache.contains_key(&page_number) {
-            // Cargar la página desde disco
+            // Load the page from disk if it is not in the cache
             self.load_page(page_number)?;
         }
         
-        // Verificar el tipo de la página si se especificó
+        // Verify the type of page if it was specified
         if let Some(expected_type) = page_type {
             match self.page_cache.get(&page_number) {
                 Some(Page::BTree(btree_page)) => {
                     if btree_page.header.page_type != expected_type {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("Tipo de página incorrecto: esperado {:?}, obtenido {:?}",
+                            format!("Type of page incorrect: expected {:?}, obtained {:?}",
                                 expected_type, btree_page.header.page_type),
                         ));
                     }
@@ -186,7 +211,7 @@ impl Pager {
                     if expected_type != PageType::Overflow {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("Tipo de página incorrecto: esperado {:?}, obtenido Overflow",
+                            format!("Type of page incorrect: expected {:?}, obtained Overflow",
                                 expected_type),
                         ));
                     }
@@ -195,47 +220,52 @@ impl Pager {
                     if expected_type != PageType::Free {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("Tipo de página incorrecto: esperado {:?}, obtenido Free",
+                            format!("Type of page incorrect: expected {:?}, obtained Free",
                                 expected_type),
                         ));
                     }
                 },
-                None => unreachable!("La página debe estar en la caché en este punto"),
+                None => unreachable!("Page should be in the cache at this point!"),
             }
         }
         
-        // Marcar la página como sucia (modificada)
+        // Mark the page as dirty (modified)
         self.dirty = true;
         
-        // Devolver la referencia mutable a la página
+        // Return the mutable reference to the page
         self.page_cache.get_mut(&page_number)
             .ok_or_else(|| io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("Página no encontrada: {}", page_number),
+                format!("Page not found: {}", page_number),
             ))
     }
-    /// Carga una página desde el disco en la caché.
-    ///
-    /// # Parámetros
-    /// * `page_number` - Número de página a cargar.
-    ///
-    /// # Errores
-    /// Retorna un error si la página no existe o no se puede leer.
+
+
+    /// Caches a page in memory.
+    /// Can be improved to use a more sophisticated caching strategy in the future.
+    /// Actually, SQLite uses a LRU-K strategy, but for now we are going to use a simple FIFO strategy.
+    /// 
+    /// # Parameters
+    /// * `page_number` - Number of the page to cache.
+    /// 
+    /// # Errors
+    /// Returns an error if the page cannot be loaded from disk.
     fn load_page(&mut self, page_number: u32) -> io::Result<()> {
-        // Verificar si la página existe
+        // Verify if the page number is valid
         let page_count = self.disk_manager.page_count()?;
         if page_number > page_count {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("Página fuera de rango: {}, máximo {}", page_number, page_count),
+                format!("Page number out of range: {}, maximum {}", page_number, page_count),
             ));
         }
         
-        // Leer la página desde el disco
-        let mut buffer = vec![0u8; self.page_size as usize];
+        // Retrieve the page from disk
+        let mut buffer = vec![0u8; self.page_size as usize]; // Allocate a buffer for the page
         self.disk_manager.read_page(page_number, &mut buffer)?;
         
-        // Interpretar el tipo de página y crear la estructura adecuada
+        // Interpret the page based on its type
+        // The first byte of the page indicates the type of page. Page 1 is always a B-Tree page.
         let page = if page_number == 1 || self.is_btree_page(&buffer)? {
             self.parse_btree_page(page_number, &buffer)?
         } else if self.is_overflow_page(&buffer)? {
@@ -244,71 +274,73 @@ impl Pager {
             self.parse_free_page(page_number, &buffer)?
         };
         
-        // Agregar la página a la caché
+        // Add the page to the cache
         self.page_cache.insert(page_number, page);
         
         Ok(())
     }
 
     
-    /// Determina si una página es una página B-Tree.
-    ///
-    /// # Parámetros
-    /// * `buffer` - Datos de la página.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al interpretar los datos.
-    ///
-    /// # Retorno
-    /// `true` si la página es una página B-Tree, `false` en caso contrario.
+    /// Determines if a page is a B-Tree page.
+    /// 
+    /// # Parameters
+    /// * `buffer` - Data of the page.
+    /// 
+    /// # Errors
+    /// Returns an error if there are problems interpreting the data.
+    /// 
+    /// # Returns
+    /// `true` if the page is a B-Tree page, `false` otherwise.
     fn is_btree_page(&self, buffer: &[u8]) -> io::Result<bool> {
         if buffer.len() < 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Buffer demasiado pequeño para determinar el tipo de página",
+                "Buffer too small to determine page type",
             ));
         }
         
-        // Los tipos de página B-Tree son 0x02, 0x05, 0x0A y 0x0D
+        // The first byte of the page indicates the type of page
         match buffer[0] {
             0x02 | 0x05 | 0x0A | 0x0D => Ok(true),
             _ => Ok(false),
         }
     }
 
-    /// Determina si una página es una página de desbordamiento.
-    ///
-    /// # Parámetros
-    /// * `buffer` - Datos de la página.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al interpretar los datos.
-    ///
-    /// # Retorno
-    /// `true` si la página es una página de desbordamiento, `false` en caso contrario.
+    /// Determines if a page is an overflow page.
+    /// 
+    /// # Parameters
+    /// * `buffer` - Data of the page.
+    /// 
+    /// # Errors
+    /// Returns an error if there are problems interpreting the data or if the buffer is too small.
     fn is_overflow_page(&self, buffer: &[u8]) -> io::Result<bool> {
-        // No hay una forma directa de determinar si una página es de desbordamiento,
-        // se necesitaría información adicional. En una implementación real, esto
-        // dependería de la estructura de la base de datos y de cómo se gestiona la lista
-        // de desbordamiento.
+        if buffer.len() < 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Buffer too small to determine page type",
+            ));
+        }
         
-        // Para simplificar, asumimos que no es una página de desbordamiento
-        Ok(false)
+        // The first byte of the page indicates the type of page
+        match buffer[0] {
+            0x10 => Ok(true),
+            _ => Ok(false),
+        }
     }
 
-    /// Parsea una página B-Tree.
-    ///
-    /// # Parámetros
-    /// * `page_number` - Número de página.
-    /// * `buffer` - Datos de la página.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al interpretar los datos.
-    ///
-    /// # Retorno
-    /// La página B-Tree parseada.
+    /// Parses a B-Tree page.
+    /// 
+    /// # Parameters
+    /// * `page_number` - Page number.
+    /// * `buffer` - Page data.
+    /// 
+    /// # Errors
+    /// Returns an error if there are problems interpreting the data.
+    /// 
+    /// # Returns
+    /// A `Page` instance representing the parsed B-Tree page.
     fn parse_btree_page(&self, page_number: u32, buffer: &[u8]) -> io::Result<Page> {
-        use std::io::Cursor;
+
         
         let mut cursor = Cursor::new(buffer);
         let header = BTreePageHeader::read_from(&mut cursor)?;
@@ -326,29 +358,26 @@ impl Pager {
         Ok(Page::BTree(btree_page))
     }
 
-    /// Parsea una página de desbordamiento.
-    ///
-    /// # Parámetros
-    /// * `page_number` - Número de página.
-    /// * `buffer` - Datos de la página.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al interpretar los datos.
-    ///
-    /// # Retorno
-    /// La página de desbordamiento parseada.
+    /// Parses an overflow page.
+    /// 
+    /// # Parameters
+    /// * `page_number` - Page number.
+    /// * `buffer` - Page data.
+    /// 
+    /// # Errors
+    /// Returns an error if there are problems interpreting the data or if the buffer is too small.
     fn parse_overflow_page(&self, page_number: u32, buffer: &[u8]) -> io::Result<Page> {
         if buffer.len() < 4 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Buffer demasiado pequeño para una página de desbordamiento",
+                "Buffer too small for an overflow page",
             ));
         }
         
-        // Los primeros 4 bytes contienen el número de la siguiente página
+        // The first 4 bytes contain the number of the next overflow page
         let next_page = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
         
-        // El resto son los datos
+        // The rest of the buffer contains the data
         let data = buffer[4..].to_vec();
         
         let overflow_page = OverflowPage::new(
@@ -361,17 +390,17 @@ impl Pager {
         Ok(Page::Overflow(overflow_page))
     }
 
-    /// Parsea una página libre.
-    ///
-    /// # Parámetros
-    /// * `page_number` - Número de página.
-    /// * `buffer` - Datos de la página.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al interpretar los datos.
-    ///
-    /// # Retorno
-    /// La página libre parseada.
+    /// Parses a free page from a buffer.
+    /// 
+    /// # Parameters
+    /// * `page_number` - Page number.
+    /// * `buffer` - Page data.
+    /// 
+    /// # Errors
+    /// Returns an error if there are problems interpreting the data or if the buffer is too small.
+    /// 
+    /// # Returns
+    /// A `Page` instance representing the parsed free page.
     fn parse_free_page(&self, page_number: u32, buffer: &[u8]) -> io::Result<Page> {
         if buffer.len() < 4 {
             return Err(io::Error::new(
@@ -380,7 +409,7 @@ impl Pager {
             ));
         }
         
-        // Los primeros 4 bytes contienen el número de la siguiente página libre
+        // The first 4 bytes contain the number of the next free page
         let next_page = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
         
         let free_page = FreePage::new(
@@ -392,22 +421,22 @@ impl Pager {
         Ok(Page::Free(free_page))
     }
 
-    /// Crea una nueva página B-Tree.
+    /// Creates a new B-Tree page.
     ///
-    /// # Parámetros
-    /// * `page_type` - Tipo de la página B-Tree.
-    /// * `right_most_page` - Para páginas interiores, el número de página del hijo más a la derecha.
-    ///
-    /// # Errores
-    /// Retorna un error si no se puede asignar la página o si el tipo no es válido.
-    ///
-    /// # Retorno
-    /// Número de la página creada.
+    /// # Parameters
+    /// * `page_type` - Type of the B-Tree page (e.g., TableLeaf, IndexLeaf, etc.).
+    /// * `right_most_page` - Number of the rightmost page (if applicable).
+    /// 
+    /// # Errors
+    /// Returns an error if the page cannot be created or if the page type is invalid.
+    /// 
+    /// # Returns
+    /// Number of the created page.
     pub fn create_btree_page(&mut self, page_type: PageType, right_most_page: Option<u32>) -> io::Result<u32> {
-        // Asignar una nueva página
+        // Asign a new page
         let page_number = self.disk_manager.allocate_pages(1)?;
         
-        // Crear la página B-Tree
+        // Create the B-Tree page
         let btree_page = BTreePage::new(
             page_type,
             self.page_size,
@@ -416,39 +445,37 @@ impl Pager {
             right_most_page,
         )?;
         
-        // Agregar la página a la caché
+        // Add the page to the cache
         self.page_cache.insert(page_number, Page::BTree(btree_page));
         self.dirty = true;
         
         Ok(page_number)
     }
 
-    /// Crea una nueva página de desbordamiento.
-    ///
-    /// # Parámetros
-    /// * `next_page` - Número de la siguiente página de desbordamiento (0 si es la última).
-    /// * `data` - Datos a almacenar en la página.
-    ///
-    /// # Errores
-    /// Retorna un error si no se puede asignar la página o si los datos son demasiado grandes.
-    ///
-    /// # Retorno
-    /// Número de la página creada.
+    /// Creates a new overflow page.
+    /// 
+    /// # Parameters
+    /// * `next_page` - Number of the next overflow page (0 if it is the last).
+    /// * `data` - Data to store in the overflow page.
+    /// 
+    /// # Errors
+    /// Returns an error if the page cannot be created or if the data is too large.
     pub fn create_overflow_page(&mut self, next_page: u32, data: Vec<u8>) -> io::Result<u32> {
-        // Verificar el tamaño de los datos
+        // Verify the size of the data
+        // The maximum size of the data is the page size minus 4 bytes for the next_page
         let max_data_size = self.page_size as usize - 4; // 4 bytes para next_page
         if data.len() > max_data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Datos demasiado grandes para la página: {} bytes, máximo {} bytes",
+                format!("Data is too big for an overflow page: {} bytes, maximum {} bytes",
                     data.len(), max_data_size),
             ));
         }
         
-        // Asignar una nueva página
+        // Asign a new page
         let page_number = self.disk_manager.allocate_pages(1)?;
         
-        // Crear la página de desbordamiento
+        // Create the overflow page
         let overflow_page = OverflowPage::new(
             next_page,
             data,
@@ -456,60 +483,59 @@ impl Pager {
             page_number,
         )?;
         
-        // Agregar la página a la caché
+        // Add the page to the cache
         self.page_cache.insert(page_number, Page::Overflow(overflow_page));
         self.dirty = true;
         
         Ok(page_number)
     }
 
-    /// Crea una nueva página libre.
-    ///
-    /// # Parámetros
-    /// * `next_page` - Número de la siguiente página libre (0 si es la última).
-    ///
-    /// # Errores
-    /// Retorna un error si no se puede asignar la página.
-    ///
-    /// # Retorno
-    /// Número de la página creada.
+    /// Create a new free page.
+    /// 
+    /// # Parameters
+    /// * `next_page` - Number of the next free page (0 if it is the last).
+    /// 
+    /// # Errors
+    /// Returns an error if the page cannot be created.
+    /// 
+    /// # Returns
+    /// Number of the created page.
     pub fn create_free_page(&mut self, next_page: u32) -> io::Result<u32> {
-        // Asignar una nueva página
+        // Add a new page
         let page_number = self.disk_manager.allocate_pages(1)?;
         
-        // Crear la página libre
+        // Create the free page
         let free_page = FreePage::new(
             next_page,
             self.page_size,
             page_number,
         );
         
-        // Agregar la página a la caché
+        // Agdd the page to the cache
         self.page_cache.insert(page_number, Page::Free(free_page));
         self.dirty = true;
         
         Ok(page_number)
     }
 
-    /// Guarda todas las páginas modificadas en disco.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al escribir los datos.
+    /// Flushes the dirty pages to disk.
+    /// Currently, it writes all the pages in the cache to disk.
+    /// This could be improved to only write the dirty pages, but for now we are lazy.
     pub fn flush(&mut self) -> io::Result<()> {
         if !self.dirty {
             return Ok(());
         }
         
-        // Guardar cada página en la caché
+        // Save all the pages in the cache to disk
         for (page_number, page) in &self.page_cache {
-            // Serializar la página
+            // Serialize the page to a buffer
             let buffer = self.serialize_page(page)?;
             
-            // Escribir la página en disco
+            // Write the page to disk
             self.disk_manager.write_page(*page_number, &buffer)?;
         }
         
-        // Sincronizar con el disco
+        // Sync the disk manager to ensure all data is written
         self.disk_manager.sync()?;
         
         self.dirty = false;
@@ -534,42 +560,43 @@ impl Pager {
                 // Por ahora, simplemente establecemos el tipo de página
                 buffer[0] = btree_page.header.page_type as u8;
                 
-                // En una implementación completa, aquí se escribirían las celdas y demás datos
+                // Missing serialization of the BTreePage
             },
             Page::Overflow(overflow_page) => {
-                // Escribir el número de la siguiente página
+                // Write the number of the next overflow page
                 let next_page_bytes = overflow_page.next_page.to_be_bytes();
                 buffer[0..4].copy_from_slice(&next_page_bytes);
                 
-                // Escribir los datos
+                // Write the data of the overflow page
                 let data_len = overflow_page.data.len().min(self.page_size as usize - 4);
                 buffer[4..4 + data_len].copy_from_slice(&overflow_page.data[0..data_len]);
             },
             Page::Free(free_page) => {
-                // Escribir el número de la siguiente página libre
+                // Write the number of the next free page
+                // The first 4 bytes of the page are reserved for the next page
                 let next_page_bytes = free_page.next_page.to_be_bytes();
                 buffer[0..4].copy_from_slice(&next_page_bytes);
+
+                
+
             },
         }
         
         Ok(buffer)
     }
 
-    /// Obtiene el número de páginas en la base de datos.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al obtener los metadatos.
-    ///
-    /// # Retorno
-    /// Número total de páginas.
+    /// Obtains the number of pages in the database.
+    /// 
+    /// # Errors
+    /// Returns an error if the page count cannot be obtained.
+    /// 
+    /// # Returns
+    /// The number of pages in the database.
     pub fn page_count(&self) -> io::Result<u32> {
         self.disk_manager.page_count()
     }
 
-    /// Cierra el pager, guardando todos los cambios pendientes.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al guardar los datos.
+    /// Closes the pager and flushes any dirty pages to disk.
     pub fn close(&mut self) -> io::Result<()> {
         self.flush()
     }

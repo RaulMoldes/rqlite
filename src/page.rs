@@ -1,87 +1,121 @@
 //! # Page Module
 //! 
-//! Este módulo define las estructuras y tipos relacionados con las páginas de la base de datos.
-//! En SQLite, una base de datos está dividida en páginas de tamaño fijo, y cada página puede
-//! ser de diferentes tipos (B-Tree, overflow, free).
-
+//! This module defines the structures and functions for handling B-Tree pages, overflow pages, and free pages in a SQLite database.
+//! It includes the representation of page headers, cell types, and methods for reading and writing pages.
+//! 
+//! BASIC PAGE STRUCTURE
+//! Each page in a SQLite database consists of a header and a series of cells. The header contains metadata about the page, such as its type, size, and offsets to the cells.
+//! After the header, the cells are stored in a contiguous block of memory. Each cell has an associated offset in the page, which is stored in a separate array (slot array).
+//! The slot array is a list of offsets that point to the start of each cell in the page. Therefore to access a cell, we only need its physical identifier, which is made up of the page_number + the slot_number.
+//! IMPORTANT: The slots grow from the beginning of the page to the end, while the cells grow from the end of the page to the beginning.
+//! Therefore a page becomes full when the slot array reaches the point where the cells start (free space pointer).
+//! --------------------------------------------------------
+//! | Page Header (B-Tree)                                 |
+//! |------------------------------------------------------|
+//! | Slot Array (Offsets to Cells)                        |
+//! |------------------------------------------------------|
+//! |                                                      |
+//! |                        DATA                          |
+//! |                                                      |
+//! |------------------------------------------------------|
 use std::fmt;
 use std::io::{self, Read, Write};
 use crate::header::HEADER_SIZE;
 
-/// Tipos de página en una base de datos SQLite.
+/// Page Types on SQLite. There are basically two types of pages: 
+/// Table pages: A table page is a B-Tree page that stores data from a table. 
+/// Index pages: An index page is a B-Tree page that stores data from an index.
+/// Each btree page can be either a leaf page or an interior page (see btree module).
+/// Special pages include overflow pages and free pages.
+/// Overflow pages are used to store data that does not fit in the main page.
+/// Free pages are used to keep track of the free space in the database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageType {
-    /// Página de índice interior (Interior del B-Tree de índice)
+    /// Index interior page (Interior of the B-Tree index)
     IndexInterior = 0x02,
-    /// Página de tabla interior (Interior del B-Tree de tabla)
+    /// Table interior page (Interior of the B-Tree table)
     TableInterior = 0x05,
-    /// Página de índice hoja (Hoja del B-Tree de índice)
+    /// Leaf index page (Leaf of the B-Tree index)
     IndexLeaf = 0x0A,
-    /// Página de tabla hoja (Hoja del B-Tree de tabla)
+    /// Leaf table page (Leaf of the B-Tree table)
     TableLeaf = 0x0D,
-    /// Página de desbordamiento (almacena datos que no caben en una página)
+    /// Overflow page (used for large data)
     Overflow = 0x10,
-    /// Página libre (no utilizada)
+    /// Free page (used for free space management)
     Free = 0x00,
 }
 
 impl PageType {
-    /// Construye un `PageType` a partir de un byte.
+    /// Builds a `PageType` from a byte marker.
     pub fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             0x02 => Some(PageType::IndexInterior),
             0x05 => Some(PageType::TableInterior),
             0x0A => Some(PageType::IndexLeaf),
             0x0D => Some(PageType::TableLeaf),
-            0x10 => Some(PageType::Overflow), // Añadido el caso para Overflow
+            0x10 => Some(PageType::Overflow), 
             0x00 => Some(PageType::Free),
-            _ => None, // No se puede distinguir automáticamente
+            _ => None, // Not a valid page type
         }
     }
 
-    /// Devuelve si la página es una página interior.
+    /// Returns true if the page is an interior page.
     pub fn is_interior(&self) -> bool {
         matches!(self, PageType::IndexInterior | PageType::TableInterior)
     }
 
-    /// Devuelve si la página es una página hoja.
+    /// Returns true if the page is a leaf page.
     pub fn is_leaf(&self) -> bool {
         matches!(self, PageType::IndexLeaf | PageType::TableLeaf)
     }
 
-    /// Devuelve si la página es parte de un índice.
+    /// Returns true if the page is part of an index.
     pub fn is_index(&self) -> bool {
         matches!(self, PageType::IndexInterior | PageType::IndexLeaf)
     }
 
-    /// Devuelve si la página es parte de una tabla.
+    /// Returns true if the page is part of a table.
     pub fn is_table(&self) -> bool {
         matches!(self, PageType::TableInterior | PageType::TableLeaf)
     }
+
+    /// Returns true if the page is an overflow page.
+    pub fn is_overflow(&self) -> bool {
+        matches!(self, PageType::Overflow)
+    }
+
+    /// Returns true if the page is a free page.
+    pub fn is_free(&self) -> bool {
+        matches!(self, PageType::Free)
+    }
 }
 
-/// Representa el encabezado de una página B-Tree.
+/// Represents the header of a B-Tree page.
 #[derive(Debug, Clone)]
 pub struct BTreePageHeader {
-    /// Tipo de página B-Tree.
+    /// Type of btree page (table, index, leaf or interior).
     pub page_type: PageType,
-    /// Desplazamiento hasta la primera celda libre.
+    /// Offset to the first free block in the page (free space pointer).
     pub first_free_block_offset: u16,
-    /// Número de celdas en la página.
+    /// Total number of slots (cells) in the page.
     pub cell_count: u16,
-    /// Offset del inicio del área de contenido celular.
+    /// Offset to the point where the content starts (after the header).
     pub content_start_offset: u16,
-    /// Número de bytes fragmentados dentro de la página.
+    /// Number of fragmented free bytes.
     pub fragmented_free_bytes: u8,
-    /// Para páginas interiores, el número de página del hijo más a la derecha.
+    /// For Btree interior pages, the page number of the rightmost child.
     pub right_most_page: Option<u32>,
 }
 
 impl BTreePageHeader {
-    /// Crea un nuevo encabezado para una página B-Tree hoja.
+    /// Creates a new header for a Leaf B-Tree page.
+    /// # Parameters
+    /// * `page_type` - Type of the page (must be a leaf type).
+    /// # Panics
+    /// Panics if the page type is not a leaf type.
     pub fn new_leaf(page_type: PageType) -> Self {
         if !page_type.is_leaf() {
-            panic!("Se esperaba un tipo de página hoja");
+            panic!("Expected a leaf page type");
         }
 
         BTreePageHeader {
@@ -94,10 +128,15 @@ impl BTreePageHeader {
         }
     }
 
-    /// Crea un nuevo encabezado para una página B-Tree interior.
+    /// Creates a new header for an interior page type.
+    /// # Parameters
+    /// * `page_type` - Type of the page (must be an interior type).
+    /// * right_most_page - Page number of the rightmost child.
+    /// # Panics
+    /// Panics if the page type is not an interior type.
     pub fn new_interior(page_type: PageType, right_most_page: u32) -> Self {
         if !page_type.is_interior() {
-            panic!("Se esperaba un tipo de página interior");
+            panic!("Expected an interior page type");
         }
 
         BTreePageHeader {
@@ -110,41 +149,40 @@ impl BTreePageHeader {
         }
     }
 
-    /// Calcula el tamaño del encabezado en bytes.
+    /// Calculates the total size of the page header in bytes.
     pub fn size(&self) -> usize {
         if self.page_type.is_leaf() {
-            8 // Páginas hoja: tipo (1) + first_free (2) + cell_count (2) + content_start (2) + fragmented_bytes (1)
+            8 // Leaf pages: type (1) + first_free (2) + cell_count (2) + content_start (2) + fragmented_bytes (1)
         } else {
-            12 // Páginas interiores: todo lo anterior + right_most_page (4)
+            12 //For interior pages we need to add the right_most_page (4)
         }
     }
 
-    /// Lee un encabezado de página B-Tree desde un origen de datos.
-    ///
-    /// # Parámetros
-    /// * `reader` - Origen de datos que implementa `Read`.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al leer los datos o si el formato no es válido.
+    /// Reads a header from a source, which must implement the trait Read.
+    /// # Parameters
+    /// * `reader` - Source from which to read the header.
+    /// # Errors
+    /// Returns an error if the header cannot be read or if the page type is unknown.
     pub fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let mut buffer = [0u8; 12]; // Tamaño máximo del encabezado
-        reader.read_exact(&mut buffer[0..1])?; // Leer el tipo de página
+        let mut buffer = [0u8; 12]; // Buffer to read the header
+        reader.read_exact(&mut buffer[0..1])?; // Read the page type
 
         let page_type = PageType::from_byte(buffer[0]).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Tipo de página B-Tree desconocido: {:#04x}", buffer[0]),
+                format!("Invalid btree page type: {:#04x}", buffer[0]),
             )
         })?;
 
-        // Leer campos comunes
+        // Read common fields
+        // Read the first free block offset, cell count, content start offset, and fragmented free bytes
         reader.read_exact(&mut buffer[1..8])?;
         let first_free_block_offset = u16::from_be_bytes([buffer[1], buffer[2]]);
         let cell_count = u16::from_be_bytes([buffer[3], buffer[4]]);
         let content_start_offset = u16::from_be_bytes([buffer[5], buffer[6]]);
         let fragmented_free_bytes = buffer[7];
 
-        // Leer campo adicional para páginas interiores
+        // Read the rightmost page number if the page type is interior
         let right_most_page = if page_type.is_interior() {
             reader.read_exact(&mut buffer[8..12])?;
             Some(u32::from_be_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]))
@@ -162,24 +200,23 @@ impl BTreePageHeader {
         })
     }
 
-    /// Escribe el encabezado de página B-Tree en un destino.
-    ///
-    /// # Parámetros
-    /// * `writer` - Destino donde se escribirá el encabezado.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al escribir los datos.
+    /// Write the header to a writer, which must implement the trait Write.
+    /// # Parameters
+    /// * `writer` - Writer to which to write the header.
+    /// # Errors
+    /// Returns an error if the header cannot be written.
+    /// 
     pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        // Escribir el tipo de página
+        // Write the page type
         writer.write_all(&[self.page_type as u8])?;
 
-        // Escribir campos comunes
+        // Write common fields
         writer.write_all(&self.first_free_block_offset.to_be_bytes())?;
         writer.write_all(&self.cell_count.to_be_bytes())?;
         writer.write_all(&self.content_start_offset.to_be_bytes())?;
         writer.write_all(&[self.fragmented_free_bytes])?;
 
-        // Escribir campo adicional para páginas interiores
+        // Write the rightmost page number if the page type is interior
         if let Some(right_most) = self.right_most_page {
             writer.write_all(&right_most.to_be_bytes())?;
         }
@@ -188,6 +225,8 @@ impl BTreePageHeader {
     }
 }
 
+
+/// Display trait implementation for BTreePageHeader
 impl fmt::Display for BTreePageHeader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "B-Tree Page Header:")?;
@@ -203,78 +242,84 @@ impl fmt::Display for BTreePageHeader {
     }
 }
 
-/// Cada celda en una página B-Tree de tabla hoja contiene un número de campos.
+/// Each cell on a B-Tree page can be of different types.
+/// Table leaf cells is where the actual data is stored.
 #[derive(Debug, Clone)]
 pub struct TableLeafCell {
-    /// Tamaño del payload en bytes.
+    /// Size of the payload in bytes.
     pub payload_size: u64,
-    /// ID de la fila (rowid).
+    /// Physical row_id (row identifier).
     pub row_id: i64,
-    /// Contenido del payload.
+    /// Payload content in bytes. The payload is the actual data stored in the cell.
     pub payload: Vec<u8>,
-    /// Referencia a página de overflow (si el payload no cabe en esta página).
+    /// Pointer to the overflow page that stores therest of the data if it does not fit in this page.
     pub overflow_page: Option<u32>,
 }
 
-/// Cada celda en una página B-Tree de tabla interior contiene una clave y un hijo.
+/// Table interior cells are used to store the keys that define the boundaries between child pages.
+/// Used for efficient searching and navigation in the B-Tree structure.
+/// (See BTree module for more details).
 #[derive(Debug, Clone)]
 pub struct TableInteriorCell {
-    /// Número de página del hijo izquierdo.
+    /// Page_number (pointer) to the left_child.
     pub left_child_page: u32,
-    /// Clave (rowid) que define el límite entre los hijos izquierdo y derecho.
+    /// Key that defines the boundary between the left and right child..
     pub key: i64,
 }
 
-/// Cada celda en una página B-Tree de índice hoja contiene un payload.
+/// Each cell in a B-Tree index leaf page contains a payload and a rowid.
 #[derive(Debug, Clone)]
 pub struct IndexLeafCell {
-    /// Tamaño del payload en bytes.
+    /// Size of the payload in bytes.
     pub payload_size: u64,
-    /// Contenido del payload.
+    /// Payload content in bytes. The payload is the actual data stored in the cell.
+    /// In this case it is the index key.
+    /// (If you created an index on column a of table t the payload will be the value of a for each row).
     pub payload: Vec<u8>,
-    /// Referencia a página de overflow (si el payload no cabe en esta página).
+    /// References to the page of overflow (if the payload does not fit in this page). This is very rare but can happen if we try to index on very large columns.
     pub overflow_page: Option<u32>,
 }
 
-/// Cada celda en una página B-Tree de índice interior contiene un payload y un hijo.
+/// Each cell in a B-Tree index interior page contains a pointer to the left child and a key.
 #[derive(Debug, Clone)]
 pub struct IndexInteriorCell {
-    /// Número de página del hijo izquierdo.
+    /// Page_number (pointer) to the left child.
     pub left_child_page: u32,
-    /// Tamaño del payload en bytes.
+    /// Payload size in bytes. In index cells, we also store the key. This is the main difference from the table cells.
     pub payload_size: u64,
-    /// Contenido del payload.
+    /// Payload content in bytes. The payload is the actual data stored in the cell.
     pub payload: Vec<u8>,
-    /// Referencia a página de overflow (si el payload no cabe en esta página).
+    /// References to the page of overflow (if the payload does not fit in this page). 
     pub overflow_page: Option<u32>,
 }
 
-/// Representa una celda de una página B-Tree, que puede ser de diferentes tipos.
+/// Represents a cell in a B-Tree page.
 #[derive(Debug, Clone)]
 pub enum BTreeCell {
-    /// Celda de tabla hoja.
+    /// Table leaf cell.
     TableLeaf(TableLeafCell),
-    /// Celda de tabla interior.
+    /// Interior table cell.
     TableInterior(TableInteriorCell),
-    /// Celda de índice hoja.
+    /// Index leaf cell.
     IndexLeaf(IndexLeafCell),
-    /// Celda de índice interior.
+    /// Interior index cell.
     IndexInterior(IndexInteriorCell),
 }
 
 impl BTreeCell {
-    /// Calcula el tamaño de la celda en bytes.
+    /// Calculates the size of the cell in bytes.
     pub fn size(&self) -> usize {
         match self {
             BTreeCell::TableLeaf(cell) => {
+                // Calculate the varint size for the payload size and row_id (See varint module for details).
                 let varint_size = crate::utils::varint_size(cell.payload_size as i64);
                 let rowid_size = crate::utils::varint_size(cell.row_id);
                 
                 varint_size + rowid_size + cell.payload.len() + 
-                    if cell.overflow_page.is_some() { 4 } else { 0 }
+                    if cell.overflow_page.is_some() { 4 } else { 0 } // We add 4 bytes for the overflow page if it exists
             },
             BTreeCell::TableInterior(cell) => {
-                4 + crate::utils::varint_size(cell.key) // 4 bytes para left_child_page + tamaño de key
+                4 + crate::utils::varint_size(cell.key) // Add 4 bytes for the left_child_page and varint size for the key
             },
             BTreeCell::IndexLeaf(cell) => {
                 let varint_size = crate::utils::varint_size(cell.payload_size as i64);
@@ -285,42 +330,43 @@ impl BTreeCell {
             BTreeCell::IndexInterior(cell) => {
                 let varint_size = crate::utils::varint_size(cell.payload_size as i64);
                 
-                4 + varint_size + cell.payload.len() + // 4 bytes para left_child_page + varint + payload
+                4 + varint_size + cell.payload.len() + // 4 bytes for the left_child_page
+                // Add the varint size for the payload
                     if cell.overflow_page.is_some() { 4 } else { 0 }
             },
         }
     }
 }
 
-/// Representa una página B-Tree de la base de datos.
+/// Represents a B-Tree page.
 #[derive(Debug, Clone)]
 pub struct BTreePage {
-    /// Encabezado de la página.
+    /// Header of the B-Tree page.
     pub header: BTreePageHeader,
-    /// Vector de índices (offsets) de celdas.
+    /// SLot array (offsets to the cells).
     pub cell_indices: Vec<u16>,
-    /// Vector de celdas.
+    /// Cells stored in the page.
     pub cells: Vec<BTreeCell>,
-    /// Tamaño de la página en bytes.
+    /// Page size in bytes.
     pub page_size: u32,
-    /// Número de página.
+    /// Page number.
     pub page_number: u32,
-    /// Espacio reservado al final de cada página.
+    /// Reserved space at the end of each page.
     pub reserved_space: u8,
 }
 
 impl BTreePage {
-    /// Crea una nueva página B-Tree.
-    ///
-    /// # Parámetros
-    /// * `page_type` - Tipo de la página B-Tree.
-    /// * `page_size` - Tamaño de la página en bytes.
-    /// * `page_number` - Número de página.
-    /// * `reserved_space` - Espacio reservado al final de cada página.
-    /// * `right_most_page` - Para páginas interiores, el número de página del hijo más a la derecha.
-    ///
-    /// # Errores
-    /// Retorna un error si el tipo de página no es válido para el valor de right_most_page.
+    /// Creates a new btree page 
+    /// # Parameters: 
+    /// * page_type - Type of the page (must be a leaf or interior type).
+    /// * page_size - Size of the page in bytes.
+    /// * page_number - Page number.
+    /// * reserved_space - Reserved space at the end of each page.
+    /// * right_most_page - Page number of the rightmost child (only for interior pages).
+    /// # Errors
+    /// Returns an error if the page type is not valid or if the right_most_page is not set for a leaf page.
+    /// # Panics
+    /// Panics if the page type is not valid or if the right_most_page is not set for a leaf page.
     pub fn new(
         page_type: PageType,
         page_size: u32,
@@ -328,26 +374,27 @@ impl BTreePage {
         reserved_space: u8,
         right_most_page: Option<u32>,
     ) -> io::Result<Self> {
+        // Check if the page type is valid
         let header = if page_type.is_leaf() {
             if right_most_page.is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "Las páginas hoja no deben tener right_most_page",
+                    "The right_most_page should not be set for leaf pages",
                 ));
             }
-            BTreePageHeader::new_leaf(page_type)
+            BTreePageHeader::new_leaf(page_type) // Create a new leaf page header
         } else {
             if let Some(right_most) = right_most_page {
                 BTreePageHeader::new_interior(page_type, right_most)
             } else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "Las páginas interiores deben tener right_most_page",
+                    "The right_most_page should be set for interior pages",
                 ));
             }
         };
 
-        // Inicializar el content_start_offset al tamaño de la página menos el espacio reservado
+        // Initialize the B-Tree page
         let mut page = BTreePage {
             header,
             cell_indices: Vec::new(),
@@ -357,92 +404,97 @@ impl BTreePage {
             reserved_space,
         };
 
-        // Inicializar el content_start_offset
+        // Inicialize the content start offset
         page.update_content_start_offset();
 
         Ok(page)
     }
 
-    /// Actualiza el offset de inicio de contenido.
+    /// Sets the content start offset based on the page size and reserved space.
     fn update_content_start_offset(&mut self) {
         self.header.content_start_offset = self.page_size as u16 - self.reserved_space as u16;
     }
 
-    /// Añade una celda a la página B-Tree.
-    ///
-    /// # Parámetros
-    /// * `cell` - Celda a añadir.
-    ///
-    /// # Errores
-    /// Retorna un error si la celda no es compatible con el tipo de página o si no hay espacio.
+    /// Addse a cell to the B-Tree page.
+    /// # Parameters
+    /// * `cell` - The cell to add to the page.
+    /// # Errors
+    /// Returns an error if the cell cannot be added due to insufficient space or if the cell type is incompatible with the page type.
+    /// # Panics
+    /// Panics if the cell type is incompatible with the page type.
+    /// # Notes
+    /// The cell is added to the page and the content start offset is updated. T
     pub fn add_cell(&mut self, cell: BTreeCell) -> io::Result<()> {
-        // Verificar compatibilidad de tipo
+        // Verify the type compatibility
+        // Check if the cell type is compatible with the page type
         match (&self.header.page_type, &cell) {
             (PageType::TableLeaf, BTreeCell::TableLeaf(_)) => {},
             (PageType::TableInterior, BTreeCell::TableInterior(_)) => {},
             (PageType::IndexLeaf, BTreeCell::IndexLeaf(_)) => {},
             (PageType::IndexInterior, BTreeCell::IndexInterior(_)) => {},
             _ => {
+                // You cannot add a cell to an overflow page or free page
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("Tipo de celda incompatible con el tipo de página: {:?}", self.header.page_type),
+                    format!("Cell type incompatible with this page: {:?}", self.header.page_type),
                 ));
             }
         }
 
-        // Calcular el espacio necesario para la celda
+        // Compute the required space to store the cell
         let cell_size = cell.size();
-        let cell_index_size = 2; // 2 bytes para el índice (offset) de la celda
+        let cell_index_size = 2; // 2 additional bytes for the cell offset in the slot array
 
-        // Calcular espacio disponible
+        // Compute the available space in the page
         let header_size = self.header.size();
-        let cell_indices_size = self.cell_indices.len() * cell_index_size;
+        let cell_indices_size = self.cell_indices.len() * cell_index_size; // Current space occupied by indices
+        // Total used space in the page. If we are at page 1 we need to add the header size, as the database header is stored on page 1.
         let used_space = if self.page_number == 1 {
             HEADER_SIZE + header_size + cell_indices_size
         } else {
             header_size + cell_indices_size
         };
 
-        // Espacio para nuevos datos
+        // Calculate the available space for the new cell
+        // The content start offset is the point where the content starts (after the header and the slot array).
         let content_start = self.header.content_start_offset as usize;
         let available_space = content_start - used_space - cell_index_size; // Restar el espacio para el nuevo índice
 
         if cell_size > available_space {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("No hay suficiente espacio para la celda: necesita {} bytes, disponible {} bytes", 
+                format!("Not enough bytes to store the cell: needed {} bytes, available {} bytes", 
                     cell_size, available_space),
             ));
         }
 
-        // Actualizar el content_start_offset
+        // Update the content start offset
         self.header.content_start_offset -= cell_size as u16;
         
-        // Añadir el índice de la celda
+        // Append the cell index to the slot array
         self.cell_indices.push(self.header.content_start_offset);
         
-        // Añadir la celda
+        // Append the cell to the cells vector
         self.cells.push(cell);
         
-        // Actualizar el contador de celdas
+        // Update the first free block offset
         self.header.cell_count += 1;
 
         Ok(())
     }
 
-    /// Devuelve el espacio libre en la página.
+    /// Returns the free space on the page .
     pub fn free_space(&self) -> usize {
         let header_size = self.header.size();
-        let cell_indices_size = self.cell_indices.len() * 2; // 2 bytes por índice
-        //println!("Header size: {}", header_size);
-        //println!("Cell indices size: {}", cell_indices_size);
+        let cell_indices_size = self.cell_indices.len() * 2; // 2 bytes per index
+     
         let used_space = if self.page_number == 1 {
             HEADER_SIZE + header_size + cell_indices_size
             
         } else {
             header_size + cell_indices_size
         };
-        //println!("Used space: {}", used_space);
+       
         
         let content_size = self.page_size as usize - self.header.content_start_offset as usize;
         
@@ -450,30 +502,32 @@ impl BTreePage {
     }
 }
 
-/// Representa una página de desbordamiento.
+/// Represents an overflow page.
 #[derive(Debug, Clone)]
 pub struct OverflowPage {
-    /// Número de la siguiente página de desbordamiento (0 si es la última).
+    /// Next overflow page number (0 if it is the last one). Overflow pages are linked together. in a linked list, allowing us to store super-large tuples.
+    /// The first page is the one that stores the first part of the data.
     pub next_page: u32,
-    /// Datos almacenados en esta página.
+    /// Data stored in the overflow page.
     pub data: Vec<u8>,
-    /// Tamaño de la página en bytes.
+    /// Page size in bytes.
     pub page_size: u32,
-    /// Número de página.
+    /// Page number.
     pub page_number: u32,
 }
 
 impl OverflowPage {
-    /// Crea una nueva página de desbordamiento.
+    /// Creates a new overflow page.
     ///
-    /// # Parámetros
-    /// * `next_page` - Número de la siguiente página de desbordamiento (0 si es la última).
-    /// * `data` - Datos a almacenar en la página.
-    /// * `page_size` - Tamaño de la página en bytes.
-    /// * `page_number` - Número de página.
-    ///
-    /// # Errores
-    /// Retorna un error si los datos no caben en la página.
+    /// # Parameters
+    /// * `next_page` - Number of the next overflow page (0 if it is the last one), no one can point to page 0 as this page is not used.
+    /// * `data` - Data to be stored in the overflow page.
+    /// * `page_size` - Size of the page in bytes.
+    /// * `page_number` - Page number.
+    /// # Errors
+    /// Returns an error if the data size exceeds the maximum page size.
+    /// # Notes
+    /// The maximum size of the data is limited by the page size minus 4 bytes for the next_page pointer.
     pub fn new(
         next_page: u32,
         data: Vec<u8>,
@@ -485,7 +539,7 @@ impl OverflowPage {
         if data.len() > max_data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Datos demasiado grandes para la página: {} bytes, máximo {} bytes",
+                format!("Data too big for the overflow page: {} bytes, max is {} bytes",
                     data.len(), max_data_size),
             ));
         }
@@ -499,24 +553,26 @@ impl OverflowPage {
     }
 }
 
-/// Representa una página libre.
+/// Represents a free page in the database.
 #[derive(Debug, Clone)]
 pub struct FreePage {
-    /// Número de la siguiente página libre (0 si es la última).
+    /// Next free page number (0 if it is the last one).
+    /// Free pages are also a linked list. This mimics the behaviour of MMAP in modern operating systems.
+    /// However on memory allocators, the free list are a double linked list.
     pub next_page: u32,
-    /// Tamaño de la página en bytes.
+    /// Page size in bytes.
     pub page_size: u32,
-    /// Número de página.
+    /// Page number.
     pub page_number: u32,
 }
 
 impl FreePage {
-    /// Crea una nueva página libre.
+    /// Creates a new free page.
     ///
-    /// # Parámetros
-    /// * `next_page` - Número de la siguiente página libre (0 si es la última).
-    /// * `page_size` - Tamaño de la página en bytes.
-    /// * `page_number` - Número de página.
+    /// # Parameters
+    /// * `next_page` - Number of the next free page (0 if it is the last one).
+    /// * `page_size` - Size of the page in bytes.
+    /// * `page_number` - Page number or page id.
     pub fn new(
         next_page: u32,
         page_size: u32,
@@ -530,19 +586,19 @@ impl FreePage {
     }
 }
 
-/// Representa una página genérica de la base de datos SQLite.
+/// Represents a generic page in the database of any type.
 #[derive(Debug, Clone)]
 pub enum Page {
-    /// Página B-Tree (tabla o índice).
+    /// Btree page.
     BTree(BTreePage),
-    /// Página de desbordamiento.
+    /// Overflow page.
     Overflow(OverflowPage),
-    /// Página libre.
+    /// Free page.
     Free(FreePage),
 }
 
 impl Page {
-    /// Devuelve el número de página.
+    /// Returns the page_number (Just a Java getter)
     pub fn page_number(&self) -> u32 {
         match self {
             Page::BTree(page) => page.page_number,
@@ -551,7 +607,7 @@ impl Page {
         }
     }
 
-    /// Devuelve el tamaño de la página en bytes.
+    /// Returns tha page size.
     pub fn page_size(&self) -> u32 {
         match self {
             Page::BTree(page) => page.page_size,
@@ -561,59 +617,60 @@ impl Page {
     }
 }
 
-// Implementaciones de From<Page> para los diferentes tipos de páginas
+// Implementations for converting Page to BTreePage, OverflowPage and FreePage
 impl From<Page> for BTreePage {
     fn from(page: Page) -> Self {
         match page {
             Page::BTree(btree_page) => btree_page,
-            _ => panic!("No se puede convertir a BTreePage: la página no es de tipo BTree"),
+            _ => panic!("Cannot convert to BTreePage: page is not of type BTree"),
         }
     }
 }
-
+// Implementation to convert Page to OverflowPage and FreePage
 impl From<Page> for OverflowPage {
     fn from(page: Page) -> Self {
         match page {
             Page::Overflow(overflow_page) => overflow_page,
-            _ => panic!("No se puede convertir a OverflowPage: la página no es de tipo Overflow"),
+            _ => panic!("Cannot Convert to OverflowPage: page is not of type Overflow"),
         }
     }
 }
-
+// Implementation to convert from Page to FreePage
 impl From<Page> for FreePage {
     fn from(page: Page) -> Self {
         match page {
             Page::Free(free_page) => free_page,
-            _ => panic!("No se puede convertir a FreePage: la página no es de tipo Free"),
+            _ => panic!("Cannot convert to FreePage: page is not of type Free"),
         }
     }
 }
 
-// También necesitamos implementar From<Page> para las referencias a estos tipos
+// The same traits to be able to convert to &BTreePage, &OverflowPage and &FreePage for &Page.
+// This is useful to avoid copying the page when we only need a reference to it.
 impl<'a> From<&'a Page> for &'a BTreePage {
     fn from(page: &'a Page) -> Self {
         match page {
             Page::BTree(btree_page) => btree_page,
-            _ => panic!("No se puede convertir a &BTreePage: la página no es de tipo BTree"),
+            _ => panic!("Cannot convert to &BTreePage: page is not of type BTree"),
         }
     }
 }
-
+// Same for a &mut reference
 impl<'a> From<&'a mut Page> for &'a mut BTreePage {
     fn from(page: &'a mut Page) -> Self {
         match page {
             Page::BTree(btree_page) => btree_page,
-            _ => panic!("No se puede convertir a &mut BTreePage: la página no es de tipo BTree"),
+            _ => panic!("Cannot convert to &mut BTreePage: page is not of type BTree"),
         }
     }
 }
 
-// Implementaciones similares para OverflowPage y FreePage
+// Same for OverflowPage and FreePage
 impl<'a> From<&'a Page> for &'a OverflowPage {
     fn from(page: &'a Page) -> Self {
         match page {
             Page::Overflow(overflow_page) => overflow_page,
-            _ => panic!("No se puede convertir a &OverflowPage: la página no es de tipo Overflow"),
+            _ => panic!("Cannot convert to &OverflowPage: page is not of type Overflow"),
         }
     }
 }
@@ -622,7 +679,7 @@ impl<'a> From<&'a mut Page> for &'a mut OverflowPage {
     fn from(page: &'a mut Page) -> Self {
         match page {
             Page::Overflow(overflow_page) => overflow_page,
-            _ => panic!("No se puede convertir a &mut OverflowPage: la página no es de tipo Overflow"),
+            _ => panic!("Cannot convert to &mut OverflowPage: page is not of type Overflow"),
         }
     }
 }
@@ -631,7 +688,7 @@ impl<'a> From<&'a Page> for &'a FreePage {
     fn from(page: &'a Page) -> Self {
         match page {
             Page::Free(free_page) => free_page,
-            _ => panic!("No se puede convertir a &FreePage: la página no es de tipo Free"),
+            _ => panic!("Cannot convert to &FreePage: page is not of type Free"),
         }
     }
 }
@@ -640,12 +697,12 @@ impl<'a> From<&'a mut Page> for &'a mut FreePage {
     fn from(page: &'a mut Page) -> Self {
         match page {
             Page::Free(free_page) => free_page,
-            _ => panic!("No se puede convertir a &mut FreePage: la página no es de tipo Free"),
+            _ => panic!("Cannot convert to &mut FreePage: page is not of type Free"),
         }
     }
 }
 
-/// Módulo de pruebas.
+/// Tests for the page module.
 #[cfg(test)]
 mod tests {
     use super::*;

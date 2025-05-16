@@ -1,36 +1,43 @@
 //! # Disk Module
 //! 
-//! Este módulo proporciona funcionalidades para acceder al sistema de archivos
-//! y realizar operaciones de lectura y escritura en el archivo de base de datos.
-
+//! This module implements the required functionality to manage the low-level operations
+//! of a SQLite database file. It provides the necessary methods to read and write pages,
+//! manage the database header, and allocate new pages as needed.
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::header::{Header, HEADER_SIZE, SQLITE_HEADER_STRING};
+use crate::header::{Header, SQLITE_HEADER_STRING};
 
-/// Gestiona las operaciones de bajo nivel sobre el archivo de base de datos.
+/// The `DiskManager` struct is responsible for managing the low-level operations of a SQLite database file.
+/// It provides methods to read and write pages, manage the database header, and allocate new pages as needed.
 ///
-/// Esta estructura se encarga de abrir, cerrar, leer y escribir en el archivo
-/// de base de datos de SQLite, proporcionando una interfaz para acceder a páginas
-/// específicas del archivo.
 pub struct DiskManager {
-    /// Ruta al archivo de base de datos.
+    /// Path to the database file.
     pub path: PathBuf,
-    /// Manejador del archivo.
+    /// Handler for the database file.
     file: File,
-    /// Tamaño de página en bytes.
+    /// Page size in bytes. Page size is fixed for the entire database.
+    /// It is set when the database is created and cannot be changed later.
     page_size: u32,
 }
 
 impl DiskManager {
-    /// Abre un archivo de base de datos existente.
+    
+    /// Creates a new DiskManager instance, and opens an existing database file.
+    /// It is a way of creating a new instance of DiskManager that is already connected to an existing database file.
+    /// Note that the page size is not set until the header is read. The page size is set up from the header of the existing database.
+    /// This method will only work on database files that are already created and have a valid header (See the header.rs module for details).
+    /// 
+    /// # Parameters
+    /// * `path` - Path to the database file.
     ///
-    /// # Parámetros
-    /// * `path` - Ruta al archivo de base de datos.
+    /// # Errors
+    /// Returns an error if the file cannot be opened or if the header is invalid.
     ///
-    /// # Errores
-    /// Retorna un error si el archivo no existe, no se puede abrir, o no es un archivo SQLite válido.
+    /// # Returns
+    /// A new instance of DiskManager connected to the specified database file.
+    ///
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -40,24 +47,31 @@ impl DiskManager {
         let mut disk_manager = DiskManager {
             path: path.as_ref().to_path_buf(),
             file,
-            page_size: 0, // Se actualizará después
+            page_size: 0, // Initialized as 0, will be set when reading the header
         };
         
-        // Leer el encabezado para obtener el tamaño de página
+        // Read the header to get the page size
+        // and set the page size in the DiskManager instance.
         let header = disk_manager.read_header()?;
         disk_manager.page_size = header.page_size;
         
         Ok(disk_manager)
     }
 
-    /// Crea un nuevo archivo de base de datos.
+    /// Creates a new database file and initializes it with the specified page size.
+    /// This method will create a new file at the specified path and write the initial header to it.
+    /// It will also allocate the first page of the database.
     ///
-    /// # Parámetros
-    /// * `path` - Ruta donde crear el archivo.
-    /// * `page_size` - Tamaño de página en bytes.
+    /// # Parameters
+    /// * `path` - Path to the database file.
+    /// * `page_size` - Size of each page in bytes. This value must be a power of 2 and between 512 and 65536.
     ///
-    /// # Errores
-    /// Retorna un error si no se puede crear el archivo o escribir en él.
+    /// # Errors
+    /// Returns an error if the file cannot be created or if the page size is invalid.
+    ///
+    /// # Returns
+    /// A new instance of DiskManager connected to the newly created database file.
+    ///
     pub fn create<P: AsRef<Path>>(path: P, page_size: u32) -> io::Result<Self> {
         // Crear el archivo
         let file = OpenOptions::new()
@@ -83,64 +97,86 @@ impl DiskManager {
         Ok(disk_manager)
     }
 
-    /// Lee el encabezado de la base de datos.
+    /// Reads the header of the database file. Will fail if the database file is corrupted or the header is invalid (aka we do not have the magic string).
+    /// 
+    /// Parameters
+    /// * `&mut self` - A mutable reference to the DiskManager instance.
+    ///     
+    /// # Errors
+    /// Returns an error if the file cannot be read or if the header is invalid.
+    /// 
+    /// # Returns
+    /// A Header instance containing the database header information.
     ///
-    /// # Errores
-    /// Retorna un error si hay problemas al leer los datos o si el encabezado no es válido.
     pub fn read_header(&mut self) -> io::Result<Header> {
         self.file.seek(SeekFrom::Start(0))?;
         
-        // Verificar primero la firma
+        // Verify the signature
+        // Read the first 16 bytes to check the signature
         let mut signature = [0u8; 16];
         self.file.read_exact(&mut signature)?;
         
         if &signature != SQLITE_HEADER_STRING {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "No es un archivo SQLite válido: firma incorrecta",
+                "Invalid signature: expected SQLITE_HEADER_STRING",
             ));
         }
         
-        // Volver al inicio para leer el encabezado completo
+        // Back to the beginning of the file to read the header
         self.file.seek(SeekFrom::Start(0))?;
         Header::read_from(&mut self.file)
     }
 
-    /// Escribe el encabezado de la base de datos.
+    /// Writes the header to the database file.
+    /// This method will overwrite the existing header in the file.
     ///
-    /// # Parámetros
-    /// * `header` - Encabezado a escribir.
+    /// # Parameters
+    /// * `header` - A reference to the Header instance to write.
     ///
-    /// # Errores
-    /// Retorna un error si hay problemas al escribir los datos.
+    /// # Errors
+    /// Returns an error if the file cannot be written to or if the header is invalid.
+    ///
     pub fn write_header(&mut self, header: &Header) -> io::Result<()> {
         self.file.seek(SeekFrom::Start(0))?;
         header.write_to(&mut self.file)
     }
 
-    /// Lee una página completa desde el archivo.
+    ///  Reads and entire page from the database file.
+    /// This method will read the specified page number from the file and store it in the provided buffer.
+    /// 
+    /// # Parameters
+    /// * `page_number` - The page number to read (starting from 1).
+    /// * `buffer` - A mutable reference to the buffer where the page data will be stored.
+    ///     
+    /// # Errors
+    /// Returns an error if the file cannot be read or if the page number is invalid.
     ///
-    /// # Parámetros
-    /// * `page_number` - Número de página a leer (comenzando desde 1).
-    /// * `buffer` - Buffer donde se escribirán los datos leídos.
+    /// # Returns
+    /// A result indicating success or failure.
     ///
-    /// # Errores
-    /// Retorna un error si hay problemas al leer los datos o si el número de página es inválido.
+    /// # Note
+    /// The page number is 1-based, meaning the first page is page 1.
+    /// The buffer size must match the page size of the database. 
+    /// We cannot read blocks from the file that are not aligned with the page size. This is why this should be the only accessor to the database file.
     pub fn read_page(&mut self, page_number: u32, buffer: &mut [u8]) -> io::Result<()> {
         if page_number == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Número de página inválido: 0 (las páginas comienzan desde 1)",
+                "Invalid page number: 0 (pages start from 1)",
             ));
         }
         
+        // Compute the page offset
+        // The offset is calculated as (page_number - 1) * page_size
+        // This is a common way to calculate the offset for fixed-size pages in a file. As all pages are the same size, we can use this formula.
         let offset = self.page_offset(page_number);
         self.file.seek(SeekFrom::Start(offset))?;
         
         if buffer.len() != self.page_size as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Tamaño de buffer incorrecto: esperado {}, obtenido {}", 
+                format!("Buffer size is incorrect: expected {}, obtained {}", 
                     self.page_size, buffer.len()),
             ));
         }
@@ -148,19 +184,24 @@ impl DiskManager {
         self.file.read_exact(buffer)
     }
 
-    /// Escribe una página completa en el archivo.
+    /// Writes an entire page to the database file.
+    /// This method will write the specified page number to the file using the provided buffer.
     ///
-    /// # Parámetros
-    /// * `page_number` - Número de página a escribir (comenzando desde 1).
-    /// * `buffer` - Buffer con los datos a escribir.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al escribir los datos o si el número de página es inválido.
+    /// # Parameters
+    /// * `page_number` - The page number to write (starting from 1).
+    /// * `buffer` - A reference to the buffer containing the page data to write.
+    /// 
+    /// # Errors
+    /// Returns an error if the file cannot be written to or if the page number is invalid.
+    /// 
+    /// # Returns
+    /// A result indicating success or failure.
+    /// 
     pub fn write_page(&mut self, page_number: u32, buffer: &[u8]) -> io::Result<()> {
         if page_number == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Número de página inválido: 0 (las páginas comienzan desde 1)",
+                "Invalid page number: 0 (pages start from 1)",
             ));
         }
         
@@ -170,7 +211,7 @@ impl DiskManager {
         if buffer.len() != self.page_size as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Tamaño de buffer incorrecto: esperado {}, obtenido {}", 
+                format!("Buffer size is incorrect: expected {}, obtained {}", 
                     self.page_size, buffer.len()),
             ));
         }
@@ -178,37 +219,43 @@ impl DiskManager {
         self.file.write_all(buffer)
     }
 
-    /// Asigna nuevas páginas al final del archivo.
+    /// Allocates new pages in the database file.
+    /// This method will increase the size of the file by the specified number of pages.
+    /// It will also initialize the new pages with zeros and update the header to reflect the new size.
+    /// It is cool because it is kind of like a malloc but in disk.
+    /// 
+    /// # Parameters
+    /// * `count` - The number of pages to allocate.
+    /// 
+    /// # Errors
+    /// Returns an error if the file cannot be resized or if the allocation fails.
     ///
-    /// # Parámetros
-    /// * `count` - Número de páginas a asignar.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al escribir en el archivo.
-    ///
-    /// # Retorno
-    /// Número de la primera página asignada.
     pub fn allocate_pages(&mut self, count: u32) -> io::Result<u32> {
-        // Obtener el tamaño actual del archivo
+        // Get the current file size
+        // This is important because we need to know how many pages we have already allocated.
+        // We will use this to calculate the new size of the file.
         let file_size = self.file.metadata()?.len();
         
-        // Calcular el número de página actual
+        // Calculate the current number of pages. We cannot use page_count() here, because it would cause an error at diskmanager creation.
+        // We will use the file size to calculate the number of pages.
+        // We add self.page_size - 1 to ensure we round up to the next page size.
         let current_pages = (file_size + self.page_size as u64 - 1) / self.page_size as u64;
         let first_new_page = current_pages as u32 + 1;
         
-        // Calcular el nuevo tamaño del archivo
+        // Calculate the new size of the file
         let new_size = file_size + (count as u64 * self.page_size as u64);
         
-        // Cambiar el tamaño del archivo
+        // Update the file size
+        // This is important because we need to ensure that the file is large enough to accommodate the new pages.
         self.file.set_len(new_size)?;
         
-        // Inicializar las nuevas páginas con ceros
+        // Initialize the new pages with zeros
         let zeros = vec![0u8; self.page_size as usize];
         for page_number in first_new_page..(first_new_page + count) {
             self.write_page(page_number, &zeros)?;
         }
         
-        // Actualizar el número de páginas en el encabezado
+        // Update the header to reflect the new size
         let mut header = self.read_header()?;
         header.database_size = first_new_page + count - 1;
         self.write_header(&header)?;
@@ -216,35 +263,43 @@ impl DiskManager {
         Ok(first_new_page)
     }
 
-    /// Calcula el desplazamiento en bytes para una página específica.
-    ///
-    /// # Parámetros
-    /// * `page_number` - Número de página (comenzando desde 1).
-    ///
-    /// # Retorno
-    /// Desplazamiento en bytes desde el inicio del archivo.
+    /// Computes the offset of a page in the database file.
+    /// This method calculates the offset based on the page number and the page size.
+    /// The offset is calculated as (page_number - 1) * page_size.
+    /// 
+    /// # Parameters
+    /// * `page_number` - The page number to calculate the offset for (starting from 1).
+    /// 
+    /// # Returns
+    /// The offset of the specified page in the database file.
+    /// 
+    /// # Note
+    /// The page number is 1-based, meaning the first page is page 1.
+    /// The offset is calculated as (page_number - 1) * page_size. Therefore, page 1 starts at offset 0, page 2 starts at offset page_size, and so on.
+    /// This is a common way to calculate the offset for fixed-size pages in a file.
     fn page_offset(&self, page_number: u32) -> u64 {
         (page_number as u64 - 1) * self.page_size as u64
     }
 
-    /// Obtiene el tamaño actual de la base de datos en páginas.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al obtener los metadatos del archivo.
-    ///
-    /// # Retorno
-    /// Número total de páginas en la base de datos.
+    /// Obtains the number of pages in the database file.
+    /// This method calculates the number of pages by dividing the file size by the page size.
     pub fn page_count(&self) -> io::Result<u32> {
         let file_size = self.file.metadata()?.len();
-        // Esto cuenta también el encabezado pero por ahora se mantiene así por que es más sencillo
-        // y no afecta el funcionamiento.
-        Ok((file_size / self.page_size as u64)  as u32) 
+        // We subtract 100 bytes to account for the header and other metadata.
+        Ok(((file_size - 100) / self.page_size as u64) as u32)
     }
 
-    /// Sincroniza los cambios al disco, asegurando que todos los datos sean escritos.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al sincronizar.
+    /// Syncs the file to ensure all data is written to disk.
+    /// This is important for ensuring data integrity, especially after writing.
+    /// Not sure if this bypasses the OS cache. According to CMU database course, 
+    /// we shoul bypass the OS cache as it is not reliable. This can be achieved by using the `O_DIRECT` flag in Linux
+    /// 
+    /// (See https://15445.courses.cs.cmu.edu/fall2024/slides/06-bufferpool.pdf for details).
+    /// # Parameters
+    /// * `&mut self` - A mutable reference to the DiskManager instance.
+    /// 
+    /// # Errors
+    /// Returns an error if the file cannot be synced.
     pub fn sync(&mut self) -> io::Result<()> {
         self.file.sync_all()
     }
@@ -348,14 +403,14 @@ mod tests {
         let mut disk_manager = DiskManager::create(&db_path, 4096).unwrap();
         
         // Verificar que solo hay una página
-        assert_eq!(disk_manager.page_count().unwrap(), 2);
+        assert_eq!(disk_manager.page_count().unwrap(), 1);
         
         // Asignar 2 páginas más
         let first_new_page = disk_manager.allocate_pages(2).unwrap();
         assert_eq!(first_new_page, 3);
         
         // Verificar que ahora hay 3 páginas
-        assert_eq!(disk_manager.page_count().unwrap(), 4);
+        assert_eq!(disk_manager.page_count().unwrap(), 3);
         
         // Verificar que el encabezado refleja el nuevo tamaño
         let header = disk_manager.read_header().unwrap();

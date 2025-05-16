@@ -1,43 +1,82 @@
 //! # Serialization Module
 //! 
-//! Este módulo proporciona funciones para serializar y deserializar diferentes
-//! tipos de datos utilizados en el formato de archivo SQLite.
+//! This module provides functionality to serialize and deserialize SQLite values.
+//! It includes the definition of SQLite data types and their corresponding values.
+//!
+//! ## SQLite Data Types: https://www.sqlite.org/datatype3.html
+//!
+//! - `NULL`: Represents a null value.
+//! - `INTEGER`: Represents signed integers of various sizes (8, 16, 24, 32, 48, and 64 bits).     
+//! - `FLOAT`: Represents a 64-bit floating-point number (IEEE 754).
+//! - `BLOB`: Represents binary data.
+//! - `STRING`: Represents UTF-8 encoded strings.
+//! 
 
 use std::io::{self, Read, Write};
 use super::varint::{encode_varint, decode_varint};
 
-/// Tipos de datos SQLite.
+/// SQLite data types as defined in the SQLite documentation.
+/// These types are used to represent the data types in SQLite files.
+/// The values are represented as integers for serialization purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqliteType {
     /// 0: NULL
     Null = 0,
-    /// 1: INTEGER de 8 bits con signo
+    /// 1: 8-bit signed INTEGER.
     Integer8 = 1,
-    /// 2: INTEGER de 16 bits con signo
+    /// 2: 16-bit signed INTEGER.
     Integer16 = 2,
-    /// 3: INTEGER de 24 bits con signo
+    /// 3: 24-bit signed INTEGER.
+    ///   (Note: SQLite does not have a 24-bit integer type, but this is used for serialization.)
     Integer24 = 3,
-    /// 4: INTEGER de 32 bits con signo
+    /// 4: 32-bit signed INTEGER.
     Integer32 = 4,
-    /// 5: INTEGER de 48 bits con signo
+    /// 5: 48-bit signed INTEGER.
     Integer48 = 5,
-    /// 6: INTEGER de 64 bits con signo
+    /// 6: 64-bit signed INTEGER.
     Integer64 = 6,
-    /// 7: Número de punto flotante de 64 bits (IEEE 754)
+    /// 7: 64 bit floating point number (IEEE 754)
     Float64 = 7,
-    /// 8: INTEGER de 0 bits, representa el valor 0
+    /// 8: 0 (0x00) 1 bit INTEGER, represents value 0. It is used to represent a boolean false.
     Integer0 = 8,
-    /// 9: INTEGER de 1 bit, representa el valor 1
+    /// 9: 1 (0x01) 1 bit INTEGER, represents value 1. It is used to represent a boolean true.
     Integer1 = 9,
-    /// 10 y 11: Reservados para uso futuro
+    /// Reserved for future use
     Reserved10 = 10,
     Reserved11 = 11,
-    /// 12: BLOB con longitud en bytes especificada por el siguiente varint
+    /// 12: BLOB with variable length specified by the following varint
     Blob = 12,
-    /// 13: STRING con longitud en bytes especificada por el siguiente varint
+    /// 13: STRING with variable length specified by the following varint
+    ///  (Note: This is a UTF-8 encoded string.)
     String = 13,
 }
 
+///! Notes on SQLITE Data Types:
+/// //! - SQLite uses dynamic typing, meaning that the type of a value is determined by its content rather than its declared type.
+/// //! - The INTEGER types are used to store signed integers of various sizes.
+/// //! - The BLOB type is used to store binary data, while the STRING type is used for UTF-8 encoded strings.
+///! - The NULL type represents a null value.
+///! - The INTEGER0 and INTEGER1 types are used to represent boolean values (false and true, respectively).
+
+/// Database engines that implement rigid typing (like PostgreSQL) may not support all SQLite types.
+///! Affinity rules for columns in SQLite determine how values are stored and retrieved.
+///! If the declared type contains the string "INT" then it is assigned INTEGER affinity.
+///! If the declared type of the column contains any of the strings "CHAR", "CLOB", or "TEXT" then that column has TEXT affinity. Notice that the type VARCHAR contains the string "CHAR" and is thus assigned TEXT affinity.
+///! If the declared type for a column contains the string "BLOB" or if no type is specified then the column has affinity BLOB.
+///! If the declared type for a column contains any of the strings "REAL", "FLOA", or "DOUB" then the column has REAL affinity.
+///! Otherwise, the affinity is NUMERIC.
+/// 
+/// In SQLite, the difference between NUMERIC and INTEGER is only important on a cast expression, but it does not affect how the values are stores under the hood.
+/// 
+/// Note that on my implementation I am not using the SQLite rules for type affinity.
+/// Instead, I am using the types as they are defined in the SQLite documentation.
+/// This is because I am not implementing a full SQLite engine, but rather storage backend.
+/// 
+/// For DateTime values, SQLite does not have a specific type. Instead, it uses built in functions that can convert from REAL, INTEGER or TEXT to DATE.
+/// As I said, I am not implementing that part of the functionality.
+
+
+/// Conversion from u8 to SqliteType
 impl From<u8> for SqliteType {
     fn from(value: u8) -> Self {
         match value {
@@ -60,32 +99,34 @@ impl From<u8> for SqliteType {
     }
 }
 
-/// Representa un valor SQLite.
+/// Represents a generic SQLite value.
+/// This enum can hold different types of values that SQLite supports.
 #[derive(Debug, Clone)]
 pub enum SqliteValue {
     /// NULL
     Null,
-    /// Entero con signo
+    /// Signed integer (compressed to the smallest possible size) 
+    /// See `utils/varint.rs` for more details.
     Integer(i64),
-    /// Número de punto flotante
+    /// Floating point number (IEEE 754)
     Float(f64),
-    /// Datos binarios
+    /// Binary data
     Blob(Vec<u8>),
-    /// Cadena UTF-8
+    /// UtF-8 encoded string
     String(String),
 }
 
 impl SqliteValue {
-    /// Serializa el valor SQLite en el formato de archivo.
+    /// Serializes the SQLite value to the specified writer.
+    /// 
+    /// # Parameters
+    /// * `writer` - The destination where the value will be serialized.
     ///
-    /// # Parámetros
-    /// * `writer` - Destino donde se escribirá el valor serializado.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al escribir en el destino.
-    ///
-    /// # Retorno
-    /// Número de bytes escritos.
+    /// # Errors
+    /// Returns an error if there are issues writing to the destination.
+    ///     
+    /// # Returns
+    /// The number of bytes written to the destination.
     pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<usize> {
         let mut bytes_written = 0;
         
@@ -174,16 +215,17 @@ impl SqliteValue {
         Ok(bytes_written)
     }
 
-    /// Deserializa un valor SQLite desde el formato de archivo.
+    /// Deserializes a SQLite value from the specified reader.
     ///
-    /// # Parámetros
-    /// * `reader` - Origen de datos que implementa `Read`.
+    /// # Parameters
+    /// * `reader` - The source from which the value will be deserialized.
     ///
-    /// # Errores
-    /// Retorna un error si hay problemas al leer los datos o si el formato no es válido.
+    /// # Errors
+    /// Returns an error if there are issues reading from the source or if the format is invalid.
+    /// 
+    /// # Returns
+    /// A tuple containing the deserialized value and the number of bytes read.
     ///
-    /// # Retorno
-    /// Tupla con el valor deserializado y el número de bytes leídos.
     pub fn deserialize<R: Read>(reader: &mut R) -> io::Result<(SqliteValue, usize)> {
         let mut type_byte = [0u8; 1];
         reader.read_exact(&mut type_byte)?;
@@ -292,7 +334,7 @@ impl SqliteValue {
                 if length < 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "Longitud negativa para BLOB",
+                        "BLOB length cannot be negative",
                     ));
                 }
                 
@@ -312,7 +354,7 @@ impl SqliteValue {
                 if length < 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "Longitud negativa para STRING",
+                        "STRING length cannot be negative",
                     ));
                 }
                 
@@ -326,7 +368,7 @@ impl SqliteValue {
                     Ok(text) => Ok((SqliteValue::String(text), bytes_read)),
                     Err(_) => Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "Datos UTF-8 inválidos para STRING",
+                        "Invalid UTF-8 sequence in STRING",
                     )),
                 }
             },
@@ -334,15 +376,14 @@ impl SqliteValue {
             // Tipos reservados o no reconocidos
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Tipo de dato SQLite no soportado: {:?}", sqlite_type),
+                format!("Data type not supported: {:?}", sqlite_type),
             )),
         }
     }
 
-    /// Calcula el tamaño en bytes que ocuparía el valor serializado.
-    ///
-    /// # Retorno
-    /// El número de bytes que ocuparía el valor serializado.
+    /// Utility function to get the serialized size of the SQLite value.
+    /// Integer 0 and 1 occupy 1 byte, while other integers occupy 1 + varint size + data size.
+    /// An extra byte is added to store the data type.
     pub fn serialized_size(&self) -> usize {
         match self {
             SqliteValue::Null => 1,
@@ -374,17 +415,18 @@ impl SqliteValue {
     }
 }
 
-/// Serializa un slice de `SqliteValue` en el formato de archivo.
+/// Serializes an slice of `SqliteValue` to the specified writer.
 ///
-/// # Parámetros
-/// * `values` - Slice de valores a serializar.
-/// * `writer` - Destino donde se escribirán los valores serializados.
+/// # Parameters
+/// * `values` - Slice of SQLite values to serialize.
+/// * `writer` - The destination where the values will be serialized.
+///     
+/// # Errors
+/// Returns an error if there are issues writing to the destination.
 ///
-/// # Errores
-/// Retorna un error si hay problemas al escribir en el destino.
+/// # Returns
+/// The number of bytes written to the destination.
 ///
-/// # Retorno
-/// Número de bytes escritos.
 pub fn serialize_values<W: Write>(values: &[SqliteValue], writer: &mut W) -> io::Result<usize> {
     let mut bytes_written = 0;
     
@@ -399,16 +441,17 @@ pub fn serialize_values<W: Write>(values: &[SqliteValue], writer: &mut W) -> io:
     Ok(bytes_written)
 }
 
-/// Deserializa un slice de `SqliteValue` desde el formato de archivo.
-///
-/// # Parámetros
-/// * `reader` - Origen de datos que implementa `Read`.
-///
-/// # Errores
-/// Retorna un error si hay problemas al leer los datos o si el formato no es válido.
-///
-/// # Retorno
-/// Tupla con el vector de valores deserializados y el número de bytes leídos.
+/// Deserializes an slice of values from the specified reader.
+/// 
+/// # Parameters
+/// * `reader` - The source from which the values will be deserialized.
+/// 
+/// # Errors
+/// Returns an error if there are issues reading from the source or if the format is invalid.
+/// 
+/// # Returns
+/// A tuple containing the deserialized values and the number of bytes read.
+/// 
 pub fn deserialize_values<R: Read>(reader: &mut R) -> io::Result<(Vec<SqliteValue>, usize)> {
     // Leer el número de valores
     let (count, mut bytes_read) = decode_varint(reader)?;
@@ -416,7 +459,7 @@ pub fn deserialize_values<R: Read>(reader: &mut R) -> io::Result<(Vec<SqliteValu
     if count < 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Número negativo de valores",
+            "Negative count for values",
         ));
     }
     

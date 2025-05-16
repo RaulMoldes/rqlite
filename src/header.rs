@@ -1,72 +1,99 @@
 //! # Header Module
 //! 
-//! Este módulo implementa la estructura del encabezado de un archivo de base de datos SQLite.
-//! El encabezado ocupa los primeros 100 bytes del archivo y contiene metadatos importantes
-//! sobre la estructura y el estado de la base de datos.
-
+//! This module defines the structure and functionality for handling the SQLite database header.
+//! It includes methods for reading and writing the header, as well as validating the page size.
+//! The header is a 100-byte structure that contains the metadata about the SQLite database file.
+//! Link to SQLite documentation: https://www.sqlite.org/fileformat.html#fileformat_header
+//! 
+//! HEADER STRUCTURE
+//! page_size: u32, // Size of a page in bytes
+//! write_version: u8, // Write version of the database
+//! read_version: u8, // Read version of the database
+//! reserved_space: u8, // Reserved space at the end of each page
+//! max_payload_fraction: u8, // Maximum payload fraction for fractional pages
+//! min_payload_fraction: u8, // Minimum payload fraction for fractional pages
+//! leaf_payload_fraction: u8, // Leaf payload fraction
+//! change_counter: u32, // Change counter for the database. Useful for handling multiple accessors.
+//! database_size: u32, // Size of the database in pages
+//! first_freelist_trunk_page: u32, // First page of the free list trunk
+//! freelist_pages: u32, // Total number of pages in the free list
+//! schema_cookie: u32, // Schema cookie for the database
+//! schema_format_number: u32, // Format number of the schema
+//! default_cache_size: u32, // Default cache size
+//! largest_root_btree_page: u32, // Largest root B-tree page
+//! text_encoding: u32, // Text encoding of the database
+//! user_version: u32, // User version of the database
+//! incremental_vacuum_mode: u32, // Incremental vacuum mode
+//! application_id: u32, // Application ID
+//! reserved: [u8; 20], // Reserved for future expansion
+//! version_valid_for: u32, // Version valid for
+//! sqlite_version_number: u32, // SQLite version number
+//! 
+//! 
+//! Currently I am serializing the header in big-endian format. This can be improved with a more dynamic approach if I am able to detect the endianness of the system..
+//
 use std::fmt;
 use std::io::{self, Read, Write};
 
-/// Tamaño del encabezado en bytes.
+/// Size of the SQLite header in bytes.
 pub const HEADER_SIZE: usize = 100;
-
-/// Cadena de inicio que identifica un archivo SQLite válido.
+/// Magic string that identifies the SQLite file format.
 pub const SQLITE_HEADER_STRING: &[u8; 16] = b"SQLite format 3\0";
 
-/// Representa el encabezado de un archivo de base de datos SQLite.
-///
-/// El encabezado contiene información importante sobre la configuración de la base de datos,
-/// como el tamaño de página, versiones del formato, y diversas configuraciones y contadores.
+/// Represents the SQLite database header.
 #[derive(Debug, Clone)]
 pub struct Header {
-    /// Tamaño de página en bytes. Debe ser una potencia de 2 entre 512 y 65536.
-    pub page_size: u32,
-    /// Versión del formato para escritura.
+    pub page_size: u32, // Always a power of 2 between 512 and 65536
     pub write_version: u8,
-    /// Versión del formato para lectura.
     pub read_version: u8,
-    /// Bytes reservados al final de cada página.
+    /// Nº of bytes reserved at the end of each page..
     pub reserved_space: u8,
-    /// Máximo orden de empaquetado de entradas fraccionales.
+
+    // Payload fractions
     pub max_payload_fraction: u8,
-    /// Mínimo orden de empaquetado de entradas fraccionales.
     pub min_payload_fraction: u8,
-    /// Orden de empaquetado de hoja.
     pub leaf_payload_fraction: u8,
-    /// Número de cambios al archivo.
+    /// History of changes to the database.
+    /// Useful for handling multiple accessors.
     pub change_counter: u32,
-    /// Tamaño de la base de datos en páginas.
+    /// Total number of pages in the database.
+    /// This is the number of pages in the database file.
     pub database_size: u32,
-    /// Número de página de la primera página de la lista libre.
+    /// Pointer to the first page of the free list trunk.
     pub first_freelist_trunk_page: u32,
-    /// Número total de páginas en la lista libre.
+    /// Number of pages in the free list trunk.
     pub freelist_pages: u32,
     /// Cookie del esquema.
     pub schema_cookie: u32,
-    /// Número de formato del esquema.
+    /// Schema format number.
+    /// This is used to determine if the schema has changed. Useful for backward and forward compatibility.
     pub schema_format_number: u32,
-    /// Tamaño de caché por defecto.
+    /// Buffer size for the default cache (number of pages).
     pub default_cache_size: u32,
-    /// Número de página de la raíz del árbol más grande de autoincrementos.
+    /// Page number of the largest root B-tree.
     pub largest_root_btree_page: u32,
-    /// Codificación de texto de la base de datos.
+    /// Encoding of the text in the database.
+    /// 1 = UTF-8, 2 = UTF-16le, 3 = UTF-16be.
     pub text_encoding: u32,
-    /// Versión de usuario.
+    /// User version of the database.
     pub user_version: u32,
-    /// Modo para vacío incremental.
+    /// Incremental vacuum mode.
     pub incremental_vacuum_mode: u32,
-    /// ID de aplicación.
+    /// Application ID.
     pub application_id: u32,
-    /// Reservado para expansión futura.
+    /// Reserved for future expansion.
     pub reserved: [u8; 20],
-    /// Número de versión de SQLite que modificó la base de datos por última vez.
+    /// SQlite version valid for.
+    /// This is used to determine if the database file is compatible with the current version of SQLite.
     pub version_valid_for: u32,
-    /// Número de versión de SQLite.
+    /// Current SQLite version number.
+    /// This is the SQLIte version number that created the database file.
     pub sqlite_version_number: u32,
 }
 
 impl Default for Header {
-    /// Crea un encabezado con valores predeterminados.
+    /// Creates a new header with default values.
+    /// 
     fn default() -> Self {
         Header {
             page_size: 4096,
@@ -96,23 +123,20 @@ impl Default for Header {
 }
 
 impl Header {
-    /// Crea un nuevo encabezado con valores predeterminados.
+    /// Creates a new header with default values.
     pub fn new() -> Self {
         Default::default()
     }
 
-    /// Crea un nuevo encabezado con un tamaño de página específico.
-    ///
-    /// # Parámetros
-    /// * `page_size` - Tamaño de página en bytes. Debe ser una potencia de 2 entre 512 y 65536.
-    ///
-    /// # Errores
-    /// Retorna un error si el tamaño de página no es válido.
+    /// Creates a new header with a specified page size.
+    /// Parameters:
+    /// * `page_size` - Size of the page in bytes. Must be a power of 2 between 512 and 65536.
+    /// Returns an `io::Result` with the header.
     pub fn with_page_size(page_size: u32) -> io::Result<Self> {
         if !is_valid_page_size(page_size) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Tamaño de página inválido: {}. Debe ser una potencia de 2 entre 512 y 65536", page_size),
+                format!("Invalid PAGE SIZE: {}. Should be a power of 2 between 512 and 65536", page_size),
             ));
         }
 
@@ -121,34 +145,39 @@ impl Header {
         Ok(header)
     }
 
-    /// Lee el encabezado desde un origen de datos.
-    ///
-    /// # Parámetros
-    /// * `reader` - Origen de datos que implementa `Read`.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al leer los datos o si el encabezado no es válido.
+    /// Reads a header from a source. The source must implement the `Read` trait.
+    /// Parameters:
+    /// * `reader` - Source that implements `Read`.
+    /// Returns an `io::Result` with the header.
     pub fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
         let mut buffer = [0u8; HEADER_SIZE];
         reader.read_exact(&mut buffer)?;
 
-        // Verificar la cadena de inicio
+        // Verify the header string
+        // The first 16 bytes should be the SQLite header string
+        // If not, return an error
+        // This can happen if the file is corrupted or not a SQLite file
         if &buffer[0..16] != SQLITE_HEADER_STRING {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "No es un archivo SQLite válido: encabezado incorrecto",
+                "Database corrupted: Invalid header string",
             ));
         }
 
+        // Read the page size
+        // The page size is stored in bytes 16 and 17
+        // If the page size is 1, it means 65536 bytes
+        // Otherwise, convert the bytes to a u16 and then to a u32
+        // The page size is stored in big-endian format
         let page_size = match u16::from_be_bytes([buffer[16], buffer[17]]) {
-            1 => 65536, // Caso especial para 65536
+            1 => 65536, // Special case for 65536
             size => u32::from(size),
         };
 
         if !is_valid_page_size(page_size) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Tamaño de página inválido: {}", page_size),
+                format!("Invalid page size: {}", page_size),
             ));
         }
 
@@ -182,28 +211,32 @@ impl Header {
         })
     }
 
-    /// Escribe el encabezado en un destino.
+    /// Writes the header to a destination. The destination must implement the `Write` trait.
+    /// Parameters:
+    /// * `writer` - Destination that implements `Write`.
+    /// Returns an `io::Result` indicating success or failure.
     ///
-    /// # Parámetros
-    /// * `writer` - Destino que implementa `Write`.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas al escribir los datos.
+    /// # Errors
+    /// This function will return an error if the write operation fails.
+    /// # Panics
+    /// This function will panic if the header size is not equal to `HEADER_SIZE`.
+    /// # Safety
+    /// This function is safe to call as long as the header is valid and the writer is valid.
     pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         let mut buffer = [0u8; HEADER_SIZE];
 
-        // Escribir la cadena de inicio
+        // First 16 bytes should be the SQLite header string
         buffer[0..16].copy_from_slice(SQLITE_HEADER_STRING);
 
-        // Escribir el tamaño de página
+        // Write the page size
         let page_size_bytes = if self.page_size == 65536 {
-            [0, 1] // Caso especial para 65536
+            [0, 1] // Special case for 65536 in big-endian format
         } else {
             ((self.page_size) as u16).to_be_bytes()
         };
         buffer[16..18].copy_from_slice(&page_size_bytes);
 
-        // Escribir el resto de campos
+        // Write the rest of the header
         buffer[18] = self.write_version;
         buffer[19] = self.read_version;
         buffer[20] = self.reserved_space;
@@ -229,12 +262,17 @@ impl Header {
         writer.write_all(&buffer)
     }
 
-    /// Incrementa el contador de cambios.
+    /// Increments the change counter.
+    /// This is useful for handling multiple accessors to the database.
+    /// The change counter is used to determine if the database has changed since it was last accessed.
+    /// This is useful for handling multiple accessors to the database.
+    /// wrapping_add is used to avoid panicing on overflow.
     pub fn increment_change_counter(&mut self) {
         self.change_counter = self.change_counter.wrapping_add(1);
     }
 }
 
+// Implementation of Display trait for Header
 impl fmt::Display for Header {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "SQLite Database Header:")?;
@@ -252,29 +290,38 @@ impl fmt::Display for Header {
     }
 }
 
-/// Verifica si un tamaño de página es válido.
+/// Utility function to check if a page size is valid.
+/// A valid page size is a power of 2 between 512 and 65536.
 ///
-/// # Parámetros
-/// * `size` - Tamaño de página a verificar.
-///
-/// # Retorno
-/// `true` si el tamaño es una potencia de 2 entre 512 y 65536, `false` en caso contrario.
+/// # Parameters:
+/// * `size` - Size of the page in bytes.
+/// # Returns true if the size is valid, false otherwise.
+/// # Errors
+/// This function will return an error if the size is not a power of 2 or if it is out of range.
+/// # Panics
+/// This function will panic if the size is not a power of 2 or if it is out of range.
+/// # Safety
+/// This function is safe to call as long as the size is valid.
 fn is_valid_page_size(size: u32) -> bool {
     if size < 512 || size > 65536 {
         return false;
     }
     
-    // Verificar si es potencia de 2
+    // Verifies if the size is a power of 2
+    // A number is a power of 2 if it has only one bit set in its binary representation
     (size & (size - 1)) == 0
 }
 
-/// Convierte el código de codificación de texto a una cadena descriptiva.
-///
-/// # Parámetros
-/// * `encoding` - Código de codificación de texto.
-///
-/// # Retorno
-/// Una cadena que describe la codificación.
+/// Utility function to convert the text encoding to a string.
+/// # Parameters:
+/// * `encoding` - Encoding number. Valid values are 1 (UTF-8), 2 (UTF-16le), and 3 (UTF-16be).
+/// # Returns a string representation of the encoding.
+/// # Errors
+/// This function will return an error if the encoding is not recognized.
+/// # Panics
+/// This function will panic if the encoding is not recognized.
+/// # Safety
+/// This function is safe to call as long as the encoding is valid.
 fn text_encoding_to_string(encoding: u32) -> String {
     match encoding {
         1 => "UTF-8".to_string(),
