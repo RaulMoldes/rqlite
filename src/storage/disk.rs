@@ -292,7 +292,7 @@ impl DiskManager {
     /// Syncs the file to ensure all data is written to disk.
     /// This is important for ensuring data integrity, especially after writing.
     /// Not sure if this bypasses the OS cache. According to CMU database course, 
-    /// we shoul bypass the OS cache as it is not reliable. This can be achieved by using the `O_DIRECT` flag in Linux
+    /// we should bypass the OS cache as it is not reliable. This can be achieved by using the `O_DIRECT` flag in Linux
     /// 
     /// (See https://15445.courses.cs.cmu.edu/fall2024/slides/06-bufferpool.pdf for details).
     /// # Parameters
