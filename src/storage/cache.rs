@@ -259,6 +259,18 @@ impl BufferPool {
             .collect()
     }
 
+     /// Gets a list of all dirty pages in the buffer pool
+    ///
+    /// # Returns
+    /// Vector of page refrences for dirty pages
+    pub fn get_dirty_pages_referenced(&self) -> Vec<(u32, &Page)> {
+        self.frames.iter()
+            .filter(|(_, frame)| frame.is_dirty())
+            .map(|(page_number, frame)| (*page_number, &frame.page))
+            .collect()
+        
+    }
+
     /// Removes a page from the buffer pool
     ///
     /// # Parameters

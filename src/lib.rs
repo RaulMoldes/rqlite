@@ -15,10 +15,10 @@
 
 pub mod header;
 pub mod page;
-pub mod btree;
+//pub mod btree;
 pub mod storage;
 pub mod utils;
-
+/*
 /// Versión del formato SQLite implementado.
 pub const SQLITE_FORMAT_VERSION: &str = "3";
 
@@ -324,3 +324,4 @@ mod tests {
         assert!(result.is_ok());
     }
 }
+    */

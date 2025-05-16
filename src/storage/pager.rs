@@ -116,7 +116,7 @@ impl Pager {
     }
 
     pub fn unpin_page(&mut self, page_number: u32) -> bool {
-        self.buffer_pool.unpin_page(page_number)
+        self.page_cache.unpin_page(page_number)
     }
 
     /// Obtains a page from the database, loading it from disk if necessary.
@@ -788,16 +788,15 @@ fn parse_btree_page(&self, page_number: u32, buffer: &[u8]) -> io::Result<Page> 
         if !self.dirty {
             return Ok(());
         }
-        
-        // Save all the pages in the cache to disk
-        for page_number in self.page_cache.get_dirty_pages() {
-            // Serialize the page to a buffer
-            let page = self.page_cache.get_page(page_number)
-                .ok_or_else(|| io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("Page not found in cache: {}", page_number),
-                ))?;
 
+        let dirty_pages = self.page_cache.get_dirty_pages_referenced();
+        if dirty_pages.is_empty() {
+            return Ok(());
+        }
+
+        
+
+        for (page_number,page) in dirty_pages{
             let buffer = self.serialize_page(page)?;
             
             // Write the page to disk
@@ -961,7 +960,6 @@ fn serialize_page(&self, page: &Page) -> io::Result<Vec<u8>> {
         self.flush()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,14 +971,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         
-        // Crear un pager
-        let result = Pager::create(&db_path, 4096, 0);
+        // Create a pager
+        let result = Pager::create(&db_path, 4096, None, 0);
         assert!(result.is_ok());
         
-        // Verificar que el archivo existe
+        // Verify that the file exists
         assert!(db_path.exists());
         
-        // Verificar que el tamaño del archivo es al menos el de una página
+        // Verify that the file size is at least one page
         let metadata = fs::metadata(&db_path).unwrap();
         assert!(metadata.len() >= 4096);
     }
@@ -990,13 +988,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         
-        // Crear un pager
+        // Create a pager
         {
-            let _pager = Pager::create(&db_path, 4096, 0).unwrap();
+            let _pager = Pager::create(&db_path, 4096, None, 0).unwrap();
         }
         
-        // Abrir el pager existente
-        let result = Pager::open(&db_path);
+        // Open the existing pager
+        let result = Pager::open(&db_path, None);
         assert!(result.is_ok());
         
         let pager = result.unwrap();
@@ -1009,22 +1007,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         
-        // Crear un pager
-        let mut pager = Pager::create(&db_path, 4096, 0).unwrap();
+        // Create a pager
+        let mut pager = Pager::create(&db_path, 4096, None, 0).unwrap();
         
-        // Crear una página B-Tree de tabla hoja
+        // Create a table leaf B-Tree page
         let page_number = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
-        assert_eq!(page_number, 3); // La primera página es el encabezado
+        assert_eq!(page_number, 3); // The first page is the header
         
-        // Verificar que la página existe en la caché
-        assert!(pager.page_cache.contains_key(&page_number));
+        // Verify that the page exists in the cache
+        assert!(pager.page_cache.contains_page(page_number));
         
-        // Flush para escribir la página a disco
+        // Flush to write the page to disk
         pager.flush().unwrap();
         
-        // Abrir un nuevo pager y verificar que la página es legible
-        let mut pager2 = Pager::open(&db_path).unwrap();
+        // Open a new pager and verify the page is readable
+        let mut pager2 = Pager::open(&db_path, None).unwrap();
         let page_result = pager2.get_page(page_number, Some(PageType::TableLeaf));
+        println!("Page result: {:?}", page_result);
         assert!(page_result.is_ok());
     }
 
@@ -1033,19 +1032,19 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         
-        // Crear un pager
-        let mut pager = Pager::create(&db_path, 4096, 0).unwrap();
+        // Create a pager
+        let mut pager = Pager::create(&db_path, 4096, None, 0).unwrap();
         
-        // Leer el encabezado
+        // Read the header
         let mut header = pager.get_header().unwrap();
         assert_eq!(header.page_size, 4096);
         assert_eq!(header.reserved_space, 0);
         
-        // Modificar el encabezado
+        // Modify the header
         header.user_version = 42;
         pager.update_header(&header).unwrap();
         
-        // Leer de nuevo y verificar
+        // Read it again and verify
         let header2 = pager.get_header().unwrap();
         assert_eq!(header2.user_version, 42);
     }
@@ -1055,81 +1054,132 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         
-        // Crear un pager
-        let mut pager = Pager::create(&db_path, 4096, 0).unwrap();
+        // Create a pager
+        let mut pager = Pager::create(&db_path, 4096, None, 0).unwrap();
         
-        // Verificar que hay una página inicialmente
-        assert_eq!(pager.page_count().unwrap(), 2); // 1 para el encabezado y 1 para la primera página
+        // Verify there is one page initially
+        assert_eq!(pager.page_count().unwrap(), 2); // 1 for the header and 1 for the first page
         
-        // Crear una página B-Tree
+        // Create a B-Tree page
         pager.create_btree_page(PageType::TableLeaf, None).unwrap();
         
-        // Verificar que ahora hay dos páginas
+        // Verify there are now three pages
         assert_eq!(pager.page_count().unwrap(), 3);
     }
 
     #[test]
-fn test_btree_page_serialization() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    
-    // Create a pager
-
-    let mut pager = Pager::create(&db_path, 4096, 0).unwrap();
-  
-    // Create a B-Tree page
-    let page_number = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
-  
-    // Add a cell to the page
-    {
-        let page = pager.get_page_mut(page_number, Some(PageType::TableLeaf)).unwrap();
+    fn test_btree_page_serialization() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        
+        // Create a pager
+        let mut pager = Pager::create(&db_path, 4096, None, 0).unwrap();
+        
+        // Create a B-Tree page
+        let page_number = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+        
+        // Add a cell to the page
+        {
+            let page = pager.get_page_mut(page_number, Some(PageType::TableLeaf)).unwrap();
+            match page {
+                Page::BTree(btree_page) => {
+                    let cell = BTreeCell::TableLeaf(TableLeafCell {
+                        payload_size: 10,
+                        row_id: 42,
+                        payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                        overflow_page: None,
+                    });
+                    
+                    // Add the cell manually to the page
+                    btree_page.cell_indices.push(4000); // Near the end of the page
+                    btree_page.cells.push(cell);
+                    btree_page.header.cell_count = 1;
+                },
+                _ => panic!("Unexpected page type"),
+            }
+        }
+        
+        // Unpin the page after modification
+        pager.page_cache.unpin_page(page_number);
+        
+        // Flush to disk
+        pager.flush().unwrap();
+        
+        // Create a new pager to read the page back
+        let mut pager2 = Pager::open(&db_path, None).unwrap();
+        
+        // Read the page
+        let page = pager2.get_page(page_number, Some(PageType::TableLeaf)).unwrap();
+        
+        // Verify the page
         match page {
             Page::BTree(btree_page) => {
-                let cell = BTreeCell::TableLeaf(TableLeafCell {
-                    payload_size: 10,
-                    row_id: 42,
-                    payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-                    overflow_page: None,
-                });
+                assert_eq!(btree_page.header.page_type, PageType::TableLeaf);
+                assert_eq!(btree_page.header.cell_count, 1);
+                assert_eq!(btree_page.cell_indices.len(), 1);
+                assert_eq!(btree_page.cells.len(), 1);
                 
-                // Add the cell manually to the page
-                btree_page.cell_indices.push(4000); // Near the end of the page
-                btree_page.cells.push(cell);
-                btree_page.header.cell_count = 1;
+                // Verify the cell
+                match &btree_page.cells[0] {
+                    BTreeCell::TableLeaf(cell) => {
+                        assert_eq!(cell.payload_size, 10);
+                        assert_eq!(cell.row_id, 42);
+                        assert_eq!(cell.payload, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+                        assert_eq!(cell.overflow_page, None);
+                    },
+                    _ => panic!("Unexpected cell type"),
+                }
             },
             _ => panic!("Unexpected page type"),
         }
+        
+        // Don't forget to unpin the page after reading
+        pager2.page_cache.unpin_page(page_number);
     }
-   
-    // Flush to disk
-    pager.flush().unwrap();
-   
-    // Create a new pager to read the page back
-    let mut pager2 = Pager::open(&db_path).unwrap();
-   
-    // Read the page
-    let page = pager2.get_page(page_number, Some(PageType::TableLeaf)).unwrap();
-   
-    // Verify the page
-    match page {
-        Page::BTree(btree_page) => {
-            assert_eq!(btree_page.header.page_type, PageType::TableLeaf);
-            assert_eq!(btree_page.header.cell_count, 1);
-            assert_eq!(btree_page.cell_indices.len(), 1);
-            assert_eq!(btree_page.cells.len(), 1);
-            
-            // Verify the cell
-            match &btree_page.cells[0] {
-                BTreeCell::TableLeaf(cell) => {
-                    assert_eq!(cell.payload_size, 10);
-                    assert_eq!(cell.row_id, 42);
-                    assert_eq!(cell.payload, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-                    assert_eq!(cell.overflow_page, None);
-                },
-                _ => panic!("Unexpected cell type"),
-            }
-        },
-        _ => panic!("Unexpected page type"),
+    
+    #[test]
+    fn test_page_pinning_and_dirty_flags() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        
+        // Create a pager with a small buffer pool to test eviction
+        let mut pager = Pager::create(&db_path, 4096, Some(2), 0).unwrap();
+        
+        // Create two pages
+        let page1 = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+        let page2 = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+        
+        // Both pages should be pinned after creation
+        assert!(pager.page_cache.is_pinned(page1));
+        assert!(pager.page_cache.is_pinned(page2));
+        
+        // Unpin page1
+        assert!(pager.page_cache.unpin_page(page1));
+        assert!(!pager.page_cache.is_pinned(page1));
+        assert!(pager.page_cache.is_pinned(page2));
+        
+        // Page2 should be marked as dirty when we get it for writing
+        let _ = pager.get_page_mut(page2, Some(PageType::TableLeaf)).unwrap();
+        assert!(pager.page_cache.is_dirty(page2));
+        
+        // Create a third page, which should evict page1 (unpinned)
+        let page3 = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+        
+        // Page1 should not be in the cache anymore (evicted)
+        assert!(!pager.page_cache.contains_page(page1));
+        assert!(pager.page_cache.contains_page(page2));
+        assert!(pager.page_cache.contains_page(page3));
+        
+        // Verify pages are still accessible after flushing
+        pager.flush().unwrap();
+        
+        // We should be able to load page1 again, even though it was evicted
+        let _ = pager.get_page(page1, Some(PageType::TableLeaf)).unwrap();
+        assert!(pager.page_cache.contains_page(page1));
+        
+        // Clean up
+        pager.page_cache.unpin_page(page1);
+        pager.page_cache.unpin_page(page2);
+        pager.page_cache.unpin_page(page3);
     }
-}
 }
