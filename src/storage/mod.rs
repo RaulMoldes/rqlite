@@ -5,7 +5,9 @@
 
 pub mod disk;
 pub mod pager;
+pub mod cache;
 
 // Re-exportar para facilitar el acceso
 pub use disk::DiskManager;
 pub use pager::Pager;
+pub use cache::BufferPool;
