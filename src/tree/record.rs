@@ -183,3 +183,196 @@ impl Default for Record {
         Self::new()
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::serialization::SqliteValue;
+    use std::io::Cursor;
+
+    #[test]
+    fn test_record_new() {
+        let record = Record::new();
+        assert!(record.values.is_empty());
+    }
+
+    #[test]
+    fn test_record_with_values() {
+        let values = vec![
+            SqliteValue::Integer(42),
+            SqliteValue::String("hello".to_string()),
+            SqliteValue::Null,
+        ];
+        let record = Record::with_values(values.clone());
+        
+        assert_eq!(record.values.len(), 3);
+        
+        match &record.values[0] {
+            SqliteValue::Integer(i) => assert_eq!(*i, 42),
+            _ => panic!("Expected Integer"),
+        }
+        
+        match &record.values[1] {
+            SqliteValue::String(s) => assert_eq!(s, "hello"),
+            _ => panic!("Expected String"),
+        }
+        
+        match &record.values[2] {
+            SqliteValue::Null => {},
+            _ => panic!("Expected Null"),
+        }
+    }
+
+    #[test]
+    fn test_record_add_value() {
+        let mut record = Record::new();
+        record.add_value(SqliteValue::Integer(123));
+        record.add_value(SqliteValue::String("test".to_string()));
+        
+        assert_eq!(record.len(), 2);
+        
+        match &record.values[0] {
+            SqliteValue::Integer(i) => assert_eq!(*i, 123),
+            _ => panic!("Expected Integer"),
+        }
+        
+        match &record.values[1] {
+            SqliteValue::String(s) => assert_eq!(s, "test"),
+            _ => panic!("Expected String"),
+        }
+    }
+
+    #[test]
+    fn test_record_get_value() {
+        let mut record = Record::new();
+        record.add_value(SqliteValue::Integer(123));
+        record.add_value(SqliteValue::String("test".to_string()));
+        
+        match record.get_value(0) {
+            Some(SqliteValue::Integer(i)) => assert_eq!(*i, 123),
+            _ => panic!("Expected Integer"),
+        }
+        
+        match record.get_value(1) {
+            Some(SqliteValue::String(s)) => assert_eq!(s, "test"),
+            _ => panic!("Expected String"),
+        }
+        
+        assert!(record.get_value(2).is_none());
+    }
+
+    #[test]
+    fn test_record_set_value() {
+        let mut record = Record::new();
+        record.add_value(SqliteValue::Integer(123));
+        
+        let result = record.set_value(0, SqliteValue::Integer(456));
+        assert!(result);
+        
+        match record.get_value(0) {
+            Some(SqliteValue::Integer(i)) => assert_eq!(*i, 456),
+            _ => panic!("Expected Integer"),
+        }
+        
+        // Test index out of range
+        let result = record.set_value(1, SqliteValue::Null);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_record_len_and_is_empty() {
+        let record = Record::new();
+        assert_eq!(record.len(), 0);
+        assert!(record.is_empty());
+        
+        let values = vec![
+            SqliteValue::Integer(42),
+            SqliteValue::String("hello".to_string()),
+        ];
+        let record = Record::with_values(values);
+        
+        assert_eq!(record.len(), 2);
+        assert!(!record.is_empty());
+    }
+
+    #[test]
+    fn test_record_serialization_roundtrip() {
+        let values = vec![
+            SqliteValue::Integer(42),
+            SqliteValue::String("hello".to_string()),
+            SqliteValue::Float(std::f64::consts::PI),
+            SqliteValue::Blob(vec![1, 2, 3]),
+            SqliteValue::Null,
+        ];
+        let record = Record::with_values(values);
+        
+        // Serialize to bytes
+        let bytes = record.to_bytes().unwrap();
+        
+        // Deserialize from bytes
+        let (deserialized_record, bytes_read) = Record::from_bytes(&bytes).unwrap();
+        
+        // Verify bytes read matches serialized size
+        assert_eq!(bytes_read, bytes.len());
+        
+        // Verify record contents
+        assert_eq!(deserialized_record.len(), record.len());
+        
+        for i in 0..record.len() {
+            match (&record.values[i], &deserialized_record.values[i]) {
+                (SqliteValue::Integer(a), SqliteValue::Integer(b)) => assert_eq!(a, b),
+                (SqliteValue::String(a), SqliteValue::String(b)) => assert_eq!(a, b),
+                (SqliteValue::Float(a), SqliteValue::Float(b)) => assert_eq!(a, b),
+                (SqliteValue::Blob(a), SqliteValue::Blob(b)) => assert_eq!(a, b),
+                (SqliteValue::Null, SqliteValue::Null) => {},
+                _ => panic!("Values don't match"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_record_serialized_size() {
+        let empty_record = Record::new();
+        assert_eq!(empty_record.serialized_size(), crate::utils::varint_size(0));
+        
+        let mut record = Record::new();
+        record.add_value(SqliteValue::Integer(42));
+        
+        let expected_size = crate::utils::varint_size(1) + SqliteValue::Integer(42).serialized_size();
+        assert_eq!(record.serialized_size(), expected_size);
+        
+        record.add_value(SqliteValue::String("test".to_string()));
+        let string_size = SqliteValue::String("test".to_string()).serialized_size();
+        
+        let expected_size = crate::utils::varint_size(2) + SqliteValue::Integer(42).serialized_size() + string_size;
+        assert_eq!(record.serialized_size(), expected_size);
+    }
+
+    #[test]
+    fn test_record_serialize_with_writer() {
+        let values = vec![
+            SqliteValue::Integer(42),
+            SqliteValue::String("hello".to_string()),
+        ];
+        let record = Record::with_values(values);
+        
+        let mut buffer = Vec::new();
+        let bytes_written = record.serialize(&mut buffer).unwrap();
+        
+        // Check bytes written
+        assert_eq!(bytes_written, buffer.len());
+        
+        // Deserialize back
+        let mut cursor = Cursor::new(buffer);
+        let (deserialized, _) = Record::deserialize(&mut cursor).unwrap();
+        
+        assert_eq!(deserialized.len(), record.len());
+    }
+
+    #[test]
+    fn test_record_default() {
+        let record = Record::default();
+        assert!(record.is_empty());
+    }
+}

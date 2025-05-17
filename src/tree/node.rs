@@ -989,3 +989,612 @@ pub fn insert_cell_ordered(&self, cell: BTreeCell) -> io::Result<(bool, Option<i
 
 
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+    use std::cell::RefCell;
+    use std::path::Path;
+    use tempfile::tempdir;
+    use crate::storage::Pager;
+    use crate::page::{PageType, BTreeCell, TableLeafCell, TableInteriorCell, IndexLeafCell, IndexInteriorCell};
+    use crate::utils::cmp::KeyValue;
+
+    // Helper function to create a test pager
+    fn create_test_pager() -> Rc<RefCell<Pager>> {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pager = Pager::create(db_path, 4096, None, 0).unwrap();
+        Rc::new(RefCell::new(pager))
+    }
+
+    #[test]
+    fn test_extract_key_from_payload() {
+        // Create a payload with an integer
+        let mut payload = Vec::new();
+        crate::utils::serialization::serialize_values(
+            &[crate::utils::serialization::SqliteValue::Integer(42)],
+            &mut payload
+        ).unwrap();
+        
+        let key = extract_key_from_payload(&payload).unwrap();
+        match key {
+            KeyValue::Integer(i) => assert_eq!(i, 42),
+            _ => panic!("Expected Integer key"),
+        }
+        
+        // Create a payload with a string
+        let mut payload = Vec::new();
+        crate::utils::serialization::serialize_values(
+            &[crate::utils::serialization::SqliteValue::String("test".to_string())],
+            &mut payload
+        ).unwrap();
+        
+        let key = extract_key_from_payload(&payload).unwrap();
+        match key {
+            KeyValue::String(s) => assert_eq!(s, "test"),
+            _ => panic!("Expected String key"),
+        }
+        
+        // Create a payload with a float
+        let mut payload = Vec::new();
+        crate::utils::serialization::serialize_values(
+            &[crate::utils::serialization::SqliteValue::Float(std::f64::consts::PI)],
+            &mut payload
+        ).unwrap();
+        
+        let key = extract_key_from_payload(&payload).unwrap();
+        match key {
+            KeyValue::Float(f) => assert_eq!(f, std::f64::consts::PI),
+            _ => panic!("Expected Float key"),
+        }
+        
+        // Test error case with empty payload
+        let payload = Vec::new();
+        let result = extract_key_from_payload(&payload);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_leaf_node() {
+        let pager = create_test_pager();
+        
+        // Create a table leaf node
+        let table_leaf = BTreeNode::create_leaf(PageType::TableLeaf, Rc::clone(&pager)).unwrap();
+        assert_eq!(table_leaf.node_type, PageType::TableLeaf);
+        assert!(table_leaf.page_number > 0);
+        
+        // Create an index leaf node
+        let index_leaf = BTreeNode::create_leaf(PageType::IndexLeaf, Rc::clone(&pager)).unwrap();
+        assert_eq!(index_leaf.node_type, PageType::IndexLeaf);
+        assert!(index_leaf.page_number > 0);
+        
+        // Test error with non-leaf page type
+        let result = BTreeNode::create_leaf(PageType::TableInterior, Rc::clone(&pager));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_interior_node() {
+        let pager = create_test_pager();
+        
+        // Create a table interior node
+        let table_interior = BTreeNode::create_interior(PageType::TableInterior, Rc::clone(&pager)).unwrap();
+        assert_eq!(table_interior.node_type, PageType::TableInterior);
+        assert!(table_interior.page_number > 0);
+        
+        // Create an index interior node
+        let index_interior = BTreeNode::create_interior(PageType::IndexInterior, Rc::clone(&pager)).unwrap();
+        assert_eq!(index_interior.node_type, PageType::IndexInterior);
+        assert!(index_interior.page_number > 0);
+        
+        // Test error with non-interior page type
+        let result = BTreeNode::create_interior(PageType::TableLeaf, Rc::clone(&pager));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cell_operations() {
+        let pager = create_test_pager();
+        
+        // Create a leaf node
+        let node = BTreeNode::create_leaf(PageType::TableLeaf, Rc::clone(&pager)).unwrap();
+        
+        // Initially the node has no cells
+        assert_eq!(node.cell_count().unwrap(), 0);
+        
+        // Create a cell
+        let cell = BTreeCell::TableLeaf(TableLeafCell {
+            payload_size: 10,
+            row_id: 42,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            overflow_page: None,
+        });
+        
+        // Insert the cell
+        let index = node.insert_cell(cell.clone()).unwrap();
+        assert_eq!(index, 0);
+        
+        // Now the node should have one cell
+        assert_eq!(node.cell_count().unwrap(), 1);
+        
+        // Get the cell back
+        let retrieved_cell = node.get_cell_owned(0).unwrap();
+        match retrieved_cell {
+            BTreeCell::TableLeaf(leaf) => {
+                assert_eq!(leaf.row_id, 42);
+                assert_eq!(leaf.payload, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+            },
+            _ => panic!("Expected TableLeaf cell"),
+        }
+        
+        // Test getting a cell with invalid index
+        let result = node.get_cell_owned(1);
+        assert!(result.is_err());
+        
+        // Test modifying a cell
+        {
+            let mut cell = node.get_cell_mut(0).unwrap();
+            match *cell {
+                BTreeCell::TableLeaf(ref mut leaf_cell) => {
+                    leaf_cell.row_id = 99;
+                },
+                _ => panic!("Expected TableLeaf cell"),
+            }
+        }
+        
+        // Verify modification
+        let modified_cell = node.get_cell_owned(0).unwrap();
+        match modified_cell {
+            BTreeCell::TableLeaf(leaf) => {
+                assert_eq!(leaf.row_id, 99);
+            },
+            _ => panic!("Expected TableLeaf cell"),
+        }
+    }
+
+    #[test]
+    fn test_right_most_child() {
+        let pager = create_test_pager();
+        
+        // Create an interior node
+        let node = BTreeNode::create_interior(PageType::TableInterior, Rc::clone(&pager)).unwrap();
+        
+        // Set the right-most child
+        node.set_right_most_child(123).unwrap();
+        
+        // Get the right-most child
+        let child = node.get_right_most_child().unwrap();
+        assert_eq!(child, 123);
+        
+        // Try to set/get right-most child on a leaf node (should fail)
+        let leaf_node = BTreeNode::create_leaf(PageType::TableLeaf, Rc::clone(&pager)).unwrap();
+        let result = leaf_node.set_right_most_child(456);
+        assert!(result.is_err());
+        
+        let result = leaf_node.get_right_most_child();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_find_table_rowid() {
+        let pager = create_test_pager();
+        
+        // Create a leaf node
+        let node = BTreeNode::create_leaf(PageType::TableLeaf, Rc::clone(&pager)).unwrap();
+        
+        // Insert some cells with different rowids
+        let cells = [
+            BTreeCell::TableLeaf(TableLeafCell {
+                payload_size: 10,
+                row_id: 10,
+                payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                overflow_page: None,
+            }),
+            BTreeCell::TableLeaf(TableLeafCell {
+                payload_size: 10,
+                row_id: 20,
+                payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                overflow_page: None,
+            }),
+            BTreeCell::TableLeaf(TableLeafCell {
+                payload_size: 10,
+                row_id: 30,
+                payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                overflow_page: None,
+            }),
+        ];
+        
+        for cell in &cells {
+            node.insert_cell(cell.clone()).unwrap();
+        }
+        
+        // Find existing rowids
+        let (found, idx) = node.find_table_rowid(10).unwrap();
+        assert!(found);
+        assert_eq!(idx, 0);
+        
+        let (found, idx) = node.find_table_rowid(20).unwrap();
+        assert!(found);
+        assert_eq!(idx, 1);
+        
+        let (found, idx) = node.find_table_rowid(30).unwrap();
+        assert!(found);
+        assert_eq!(idx, 2);
+        
+        // Find non-existing rowids
+        let (found, idx) = node.find_table_rowid(5).unwrap();
+        assert!(!found);
+        assert_eq!(idx, 0); // Should be inserted before rowid 10
+        
+        let (found, idx) = node.find_table_rowid(15).unwrap();
+        assert!(!found);
+        assert_eq!(idx, 1); // Should be inserted between 10 and 20
+        
+        let (found, idx) = node.find_table_rowid(40).unwrap();
+        assert!(!found);
+        assert_eq!(idx, 3); // Should be inserted after rowid 30
+        
+        // Test error with non-leaf node
+        let interior_node = BTreeNode::create_interior(PageType::TableInterior, Rc::clone(&pager)).unwrap();
+        let result = interior_node.find_table_rowid(10);
+        assert!(result.is_err());
+    }
+
+
+    #[test]
+    fn test_find_table_key() {
+        let pager = create_test_pager();
+        
+        // Create an interior node
+        let node = BTreeNode::create_interior(PageType::TableInterior, Rc::clone(&pager)).unwrap();
+        
+        // Set right-most child
+        node.set_right_most_child(40).unwrap();
+        
+        // Insert some cells with different keys
+        let cells = [
+            BTreeCell::TableInterior(TableInteriorCell {
+                left_child_page: 10,
+                key: 15,
+            }),
+            BTreeCell::TableInterior(TableInteriorCell {
+                left_child_page: 20,
+                key: 25,
+            }),
+            BTreeCell::TableInterior(TableInteriorCell {
+                left_child_page: 30,
+                key: 35,
+            }),
+        ];
+        
+        for cell in &cells {
+            node.insert_cell(cell.clone()).unwrap();
+        }
+        
+        // Find existing keys
+        let (found, child, idx) = node.find_table_key(15).unwrap();
+        assert!(found);
+        assert_eq!(child, 10);
+        assert_eq!(idx, 0);
+        
+        let (found, child, idx) = node.find_table_key(25).unwrap();
+        assert!(found);
+        assert_eq!(child, 20);
+        assert_eq!(idx, 1);
+        
+        let (found, child, idx) = node.find_table_key(35).unwrap();
+        assert!(found);
+        assert_eq!(child, 30);
+        assert_eq!(idx, 2);
+        
+        // Find non-existing keys
+        let (found, child, _) = node.find_table_key(10).unwrap();
+        assert!(!found);
+        assert_eq!(child, 10); // Should go to the left child of the first cell
+        
+        let (found, child, _) = node.find_table_key(20).unwrap();
+        assert!(!found);
+        assert_eq!(child, 10); // Should go to the left child of the first cell
+        
+        let (found, child, _) = node.find_table_key(30).unwrap();
+        assert!(!found);
+        assert_eq!(child, 20); // Should go to the left child of the second cell
+        
+        let (found, child, _) = node.find_table_key(40).unwrap();
+        assert!(!found);
+        assert_eq!(child, 30); // Should go to the left child of the third cell
+        
+        let (found, child, _) = node.find_table_key(50).unwrap();
+        assert!(!found);
+        assert_eq!(child, 40); // Should go
+    }
+
+    #[test]
+    fn test_find_index_key() {
+        let pager = create_test_pager();
+        
+        // Create an index leaf node
+        let node = BTreeNode::create_leaf(PageType::IndexLeaf, Rc::clone(&pager)).unwrap();
+        
+        // Create payloads with different keys
+        let create_index_payload = |key: i64| -> Vec<u8> {
+            let mut payload = Vec::new();
+            crate::utils::serialization::serialize_values(
+                &[crate::utils::serialization::SqliteValue::Integer(key)],
+                &mut payload
+            ).unwrap();
+            payload
+        };
+        
+        // Insert cells with different keys
+        let keys = [10, 20, 30];
+        for &key in &keys {
+            let payload = create_index_payload(key);
+            let cell = BTreeCell::IndexLeaf(IndexLeafCell {
+                payload_size: payload.len() as u64,
+                payload,
+                overflow_page: None,
+            });
+            node.insert_cell(cell).unwrap();
+        }
+        
+        // Find existing keys
+        let (found, idx) = node.find_index_key(&KeyValue::Integer(10)).unwrap();
+        assert!(found);
+        assert_eq!(idx, 0);
+        
+        let (found, idx) = node.find_index_key(&KeyValue::Integer(20)).unwrap();
+        assert!(found);
+        assert_eq!(idx, 1);
+        
+        let (found, idx) = node.find_index_key(&KeyValue::Integer(30)).unwrap();
+        assert!(found);
+        assert_eq!(idx, 2);
+        
+        // Find non-existing keys
+        let (found, idx) = node.find_index_key(&KeyValue::Integer(5)).unwrap();
+        assert!(!found);
+        assert_eq!(idx, 0); // Should be inserted before key 10
+        
+        let (found, idx) = node.find_index_key(&KeyValue::Integer(15)).unwrap();
+        assert!(!found);
+        assert_eq!(idx, 1); // Should be inserted between 10 and 20
+        
+        let (found, idx) = node.find_index_key(&KeyValue::Integer(40)).unwrap();
+        assert!(!found);
+        assert_eq!(idx, 3); // Should be inserted after key 30
+    }
+
+    #[test]
+    fn test_insert_cell_ordered_table_leaf() {
+        let pager = create_test_pager();
+        
+        // Create a leaf node
+        let node = BTreeNode::create_leaf(PageType::TableLeaf, Rc::clone(&pager)).unwrap();
+        
+        // Insert cells with rowids in random order
+        let rowids = [30, 10, 50, 20, 40];
+        for &rowid in &rowids {
+            let cell = BTreeCell::TableLeaf(TableLeafCell {
+                payload_size: 10,
+                row_id: rowid,
+                payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                overflow_page: None,
+            });
+            
+            let (split, median_key, new_node) = node.insert_cell_ordered(cell).unwrap();
+            assert!(!split);
+            assert!(median_key.is_none());
+            assert!(new_node.is_none());
+        }
+        
+        // Verify cells are ordered by rowid
+        let cell_count = node.cell_count().unwrap();
+        assert_eq!(cell_count, 5);
+        
+        for i in 0..cell_count {
+            let cell = node.get_cell_owned(i).unwrap();
+            match cell {
+                BTreeCell::TableLeaf(leaf) => {
+                    assert_eq!(leaf.row_id, (i as i64 + 1) * 10);
+                },
+                _ => panic!("Expected TableLeaf cell"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_insert_cell_ordered_table_interior() {
+        let pager = create_test_pager();
+        
+        // Create an interior node
+        let node = BTreeNode::create_interior(PageType::TableInterior, Rc::clone(&pager)).unwrap();
+        
+        // Set right-most child
+        node.set_right_most_child(100).unwrap();
+        
+        // Insert cells with keys in random order
+        let keys = [(30, 35), (10, 15), (50, 55), (20, 25), (40, 45)];
+        for &(left_child, key) in &keys {
+            let cell = BTreeCell::TableInterior(TableInteriorCell {
+                left_child_page: left_child,
+                key,
+            });
+            
+            let (split, median_key, new_node) = node.insert_cell_ordered(cell).unwrap();
+            assert!(!split);
+            assert!(median_key.is_none());
+            assert!(new_node.is_none());
+        }
+        
+        // Verify cells are ordered by key
+        let cell_count = node.cell_count().unwrap();
+        assert_eq!(cell_count, 5);
+        
+        for i in 0..cell_count {
+            let cell = node.get_cell_owned(i).unwrap();
+            match cell {
+                BTreeCell::TableInterior(interior) => {
+                    assert_eq!(interior.key, (i as i64 + 1) * 15);
+                    assert_eq!(interior.left_child_page, (i as u32 + 1) * 10);
+                },
+                _ => panic!("Expected TableInterior cell"),
+            }
+        }
+        
+        // Verify right-most child is still set
+        let right_most = node.get_right_most_child().unwrap();
+        assert_eq!(right_most, 100);
+    }
+
+    #[test]
+    fn test_node_split() {
+        let pager = create_test_pager();
+        
+        // Create a leaf node
+        let node = BTreeNode::create_leaf(PageType::TableLeaf, Rc::clone(&pager)).unwrap();
+        
+        // Insert enough cells to cause a split
+        // First, fill the node with 10 cells
+        for i in 0..10 {
+            let rowid = i * 10;
+            let cell = BTreeCell::TableLeaf(TableLeafCell {
+                payload_size: 300, // Large payload to fill the node quickly
+                row_id: rowid,
+                payload: vec![i as u8; 300],
+                overflow_page: None,
+            });
+            
+            let (split, _, _) = node.insert_cell_ordered(cell).unwrap();
+            assert!(!split); // No split yet
+        }
+        
+        // Now insert one more cell to cause a split
+        let cell = BTreeCell::TableLeaf(TableLeafCell {
+            payload_size: 300,
+            row_id: 100,
+            payload: vec![10; 300],
+            overflow_page: None,
+        });
+        
+        let (split, median_key, new_node) = node.insert_cell_ordered(cell).unwrap();
+        
+        // The node should have split
+        assert!(split);
+        assert!(median_key.is_some());
+        assert!(new_node.is_some());
+        
+        let median = median_key.unwrap();
+        let right_node = new_node.unwrap();
+        
+        // Verify the median key
+        assert!(median > 0);
+        
+        // Original node should have cells with rowid < median
+        let left_cells = node.cell_count().unwrap();
+        for i in 0..left_cells {
+            let cell = node.get_cell_owned(i).unwrap();
+            match cell {
+                BTreeCell::TableLeaf(leaf) => {
+                    assert!(leaf.row_id < median);
+                },
+                _ => panic!("Expected TableLeaf cell"),
+            }
+        }
+        
+        // New node should have cells with rowid >= median
+        let right_cells = right_node.cell_count().unwrap();
+        for i in 0..right_cells {
+            let cell = right_node.get_cell_owned(i).unwrap();
+            match cell {
+                BTreeCell::TableLeaf(leaf) => {
+                    assert!(leaf.row_id >= median);
+                },
+                _ => panic!("Expected TableLeaf cell"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_free_space() {
+        let pager = create_test_pager();
+        
+        // Create a leaf node
+        let node = BTreeNode::create_leaf(PageType::TableLeaf, Rc::clone(&pager)).unwrap();
+        
+        // Get initial free space
+        let initial_free_space = node.free_space().unwrap();
+        assert!(initial_free_space > 0);
+        
+        // Add a cell
+        let cell = BTreeCell::TableLeaf(TableLeafCell {
+            payload_size: 100,
+            row_id: 1,
+            payload: vec![0; 100],
+            overflow_page: None,
+        });
+        
+        node.insert_cell(cell).unwrap();
+        
+        // Get free space after adding cell
+        let free_space_after = node.free_space().unwrap();
+        
+        // Free space should have decreased
+        assert!(free_space_after < initial_free_space);
+        
+        // The difference should be the cell size plus the cell index size (2 bytes)
+        let cell_size = 100 + 1 + 1; // payload + varint(payload_size) + varint(rowid)
+        let expected_diff = cell_size + 2;
+        
+        // Due to alignment and other factors, we may not get exact match,
+        // but the difference should be close
+        let actual_diff = initial_free_space - free_space_after;
+        assert!(actual_diff >= expected_diff - 5 && actual_diff <= expected_diff + 5);
+    }
+
+    #[test]
+    fn test_open_node() {
+        let pager = create_test_pager();
+        
+        // Create a leaf node
+        let node = BTreeNode::create_leaf(PageType::TableLeaf, Rc::clone(&pager)).unwrap();
+        let page_number = node.page_number;
+        
+        // Add a cell to the node
+        let cell = BTreeCell::TableLeaf(TableLeafCell {
+            payload_size: 10,
+            row_id: 42,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            overflow_page: None,
+        });
+        
+        node.insert_cell(cell).unwrap();
+        
+        // Open the node again
+        let reopened_node = BTreeNode::open(page_number, PageType::TableLeaf, Rc::clone(&pager)).unwrap();
+        
+        // Verify the node type and page number
+        assert_eq!(reopened_node.node_type, PageType::TableLeaf);
+        assert_eq!(reopened_node.page_number, page_number);
+        
+        // Verify the cell count
+        assert_eq!(reopened_node.cell_count().unwrap(), 1);
+        
+        // Verify the cell content
+        let cell = reopened_node.get_cell_owned(0).unwrap();
+        match cell {
+            BTreeCell::TableLeaf(leaf) => {
+                assert_eq!(leaf.row_id, 42);
+                assert_eq!(leaf.payload, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+            },
+            _ => panic!("Expected TableLeaf cell"),
+        }
+        
+        // Test opening with incorrect page type
+        let result = BTreeNode::open(page_number, PageType::TableInterior, Rc::clone(&pager));
+        assert!(result.is_err());
+    }
+}

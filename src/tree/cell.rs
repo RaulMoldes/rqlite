@@ -256,3 +256,275 @@ impl BTreeCellFactory {
         (usable_size - 12) * min_payload_fraction as usize / 255
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::page::{BTreeCell, TableLeafCell, TableInteriorCell, IndexLeafCell, IndexInteriorCell};
+
+    // Test helper function to create a simple payload
+    fn create_test_payload(size: usize) -> Vec<u8> {
+        (0..size).map(|i| (i % 256) as u8).collect()
+    }
+
+    #[test]
+    fn test_create_table_leaf_cell_small_payload() {
+        let rowid = 42;
+        let payload = create_test_payload(100);
+        let max_local = 200;
+        let min_local = 50;
+        let usable_size = 1000;
+        
+        let (cell, overflow) = BTreeCellFactory::create_table_leaf_cell(
+            rowid, 
+            payload.clone(), 
+            max_local, 
+            min_local, 
+            usable_size
+        ).unwrap();
+        
+        // With small payload, everything should fit locally
+        assert!(overflow.is_none());
+        
+        // Check cell type and contents
+        match cell {
+            BTreeCell::TableLeaf(leaf) => {
+                assert_eq!(leaf.row_id, rowid);
+                assert_eq!(leaf.payload_size as usize, payload.len());
+                assert_eq!(leaf.payload, payload);
+                assert!(leaf.overflow_page.is_none());
+            },
+            _ => panic!("Expected TableLeaf cell"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_leaf_cell_large_payload() {
+        let rowid = 42;
+        let payload = create_test_payload(300);
+        let max_local = 100;
+        let min_local = 50;
+        let usable_size = 1000;
+        
+        let (cell, overflow) = BTreeCellFactory::create_table_leaf_cell(
+            rowid, 
+            payload.clone(), 
+            max_local, 
+            min_local, 
+            usable_size
+        ).unwrap();
+        
+        // With large payload, some data should go to overflow
+        assert!(overflow.is_some());
+        let overflow_data = overflow.unwrap();
+        
+        // Check cell type and contents
+        match cell {
+            BTreeCell::TableLeaf(leaf) => {
+                assert_eq!(leaf.row_id, rowid);
+                assert_eq!(leaf.payload_size as usize, payload.len());
+                
+                // Check that the cell contains the first part of payload
+                assert_eq!(leaf.payload.len(), min_local);
+                assert_eq!(&leaf.payload[..], &payload[..min_local]);
+                
+                // Check overflow data contains the rest
+                assert_eq!(overflow_data, payload[min_local..].to_vec());
+                
+                // No overflow page yet
+                assert!(leaf.overflow_page.is_none());
+            },
+            _ => panic!("Expected TableLeaf cell"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_interior_cell() {
+        let left_child_page = 123;
+        let key = 456;
+        
+        let cell = BTreeCellFactory::create_table_interior_cell(left_child_page, key);
+        
+        match cell {
+            BTreeCell::TableInterior(interior) => {
+                assert_eq!(interior.left_child_page, left_child_page);
+                assert_eq!(interior.key, key);
+            },
+            _ => panic!("Expected TableInterior cell"),
+        }
+    }
+
+    #[test]
+    fn test_create_index_leaf_cell_small_payload() {
+        let payload = create_test_payload(100);
+        let max_local = 200;
+        let min_local = 50;
+        let usable_size = 1000;
+        
+        let (cell, overflow) = BTreeCellFactory::create_index_leaf_cell(
+            payload.clone(), 
+            max_local, 
+            min_local, 
+            usable_size
+        ).unwrap();
+        
+        // With small payload, everything should fit locally
+        assert!(overflow.is_none());
+        
+        // Check cell type and contents
+        match cell {
+            BTreeCell::IndexLeaf(leaf) => {
+                assert_eq!(leaf.payload_size as usize, payload.len());
+                assert_eq!(leaf.payload, payload);
+                assert!(leaf.overflow_page.is_none());
+            },
+            _ => panic!("Expected IndexLeaf cell"),
+        }
+    }
+
+    #[test]
+    fn test_create_index_leaf_cell_large_payload() {
+        let payload = create_test_payload(300);
+        let max_local = 100;
+        let min_local = 50;
+        let usable_size = 1000;
+        
+        let (cell, overflow) = BTreeCellFactory::create_index_leaf_cell(
+            payload.clone(), 
+            max_local, 
+            min_local, 
+            usable_size
+        ).unwrap();
+        
+        // With large payload, some data should go to overflow
+        assert!(overflow.is_some());
+        let overflow_data = overflow.unwrap();
+        
+        // Check cell type and contents
+        match cell {
+            BTreeCell::IndexLeaf(leaf) => {
+                assert_eq!(leaf.payload_size as usize, payload.len());
+                
+                // Check that the cell contains the first part of payload
+                assert_eq!(leaf.payload.len(), min_local);
+                assert_eq!(&leaf.payload[..], &payload[..min_local]);
+                
+                // Check overflow data contains the rest
+                assert_eq!(overflow_data, payload[min_local..].to_vec());
+                
+                // No overflow page yet
+                assert!(leaf.overflow_page.is_none());
+            },
+            _ => panic!("Expected IndexLeaf cell"),
+        }
+    }
+
+    #[test]
+    fn test_create_index_interior_cell_small_payload() {
+        let left_child_page = 123;
+        let payload = create_test_payload(100);
+        let max_local = 200;
+        let min_local = 50;
+        let usable_size = 1000;
+        
+        let (cell, overflow) = BTreeCellFactory::create_index_interior_cell(
+            left_child_page,
+            payload.clone(), 
+            max_local, 
+            min_local, 
+            usable_size
+        ).unwrap();
+        
+        // With small payload, everything should fit locally
+        assert!(overflow.is_none());
+        
+        // Check cell type and contents
+        match cell {
+            BTreeCell::IndexInterior(interior) => {
+                assert_eq!(interior.left_child_page, left_child_page);
+                assert_eq!(interior.payload_size as usize, payload.len());
+                assert_eq!(interior.payload, payload);
+                assert!(interior.overflow_page.is_none());
+            },
+            _ => panic!("Expected IndexInterior cell"),
+        }
+    }
+
+    #[test]
+    fn test_create_index_interior_cell_large_payload() {
+        let left_child_page = 123;
+        let payload = create_test_payload(300);
+        let max_local = 100;
+        let min_local = 50;
+        let usable_size = 1000;
+        
+        let (cell, overflow) = BTreeCellFactory::create_index_interior_cell(
+            left_child_page,
+            payload.clone(), 
+            max_local, 
+            min_local, 
+            usable_size
+        ).unwrap();
+        
+        // With large payload, some data should go to overflow
+        assert!(overflow.is_some());
+        let overflow_data = overflow.unwrap();
+        
+        // Check cell type and contents
+        match cell {
+            BTreeCell::IndexInterior(interior) => {
+                assert_eq!(interior.left_child_page, left_child_page);
+                assert_eq!(interior.payload_size as usize, payload.len());
+                
+                // Check that the cell contains the first part of payload
+                assert_eq!(interior.payload.len(), min_local);
+                assert_eq!(&interior.payload[..], &payload[..min_local]);
+                
+                // Check overflow data contains the rest
+                assert_eq!(overflow_data, payload[min_local..].to_vec());
+                
+                // No overflow page yet
+                assert!(interior.overflow_page.is_none());
+            },
+            _ => panic!("Expected IndexInterior cell"),
+        }
+    }
+
+    #[test]
+    fn test_max_local_payload() {
+        let usable_size = 1000;
+        
+        // Max fraction = 255 (100%)
+        let max_local_100_percent = BTreeCellFactory::max_local_payload(usable_size, 255);
+        assert_eq!(max_local_100_percent, 965); // (1000-12)*255/255 capped at 1000-35
+        
+        // Max fraction = 128 (50%)
+        let max_local_50_percent = BTreeCellFactory::max_local_payload(usable_size, 128);
+        let expected = (usable_size - 12) * 128 / 255;
+        assert_eq!(max_local_50_percent, expected);
+        
+        // Max fraction = 0 (0%)
+        let max_local_0_percent = BTreeCellFactory::max_local_payload(usable_size, 0);
+        assert_eq!(max_local_0_percent, 0);
+    }
+
+    #[test]
+    fn test_min_local_payload() {
+        let usable_size = 1000;
+        
+        // Min fraction = 32 (12.5%)
+        let min_local_12_5_percent = BTreeCellFactory::min_local_payload(usable_size, 32);
+        let expected = (usable_size - 12) * 32 / 255;
+        assert_eq!(min_local_12_5_percent, expected);
+        
+        // Min fraction = 0 (0%)
+        let min_local_0_percent = BTreeCellFactory::min_local_payload(usable_size, 0);
+        assert_eq!(min_local_0_percent, 0);
+        
+        // Min fraction = 255 (100%)
+        let min_local_100_percent = BTreeCellFactory::min_local_payload(usable_size, 255);
+        let expected = (usable_size - 12) * 255 / 255;
+        assert_eq!(min_local_100_percent, expected);
+    }
+}

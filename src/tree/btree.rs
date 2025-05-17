@@ -1583,3 +1583,411 @@ fn get_page_type(&self, page_number: u32) -> io::Result<PageType> {
 }
 }
 
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use std::path::Path;
+    use crate::storage::Pager;
+    use crate::tree::record::Record;
+    use crate::utils::serialization::SqliteValue;
+
+    // Helper function to create a test pager
+    fn create_test_pager() -> Rc<RefCell<Pager>> {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pager = Pager::create(db_path, 4096, None, 0).unwrap();
+        Rc::new(RefCell::new(pager))
+    }
+
+    // Helper function to create a test record
+    fn create_test_record(values: Vec<SqliteValue>) -> Record {
+        Record::with_values(values)
+    }
+
+    #[test]
+    fn test_create_table_btree() {
+        let pager = create_test_pager();
+        
+        // Create a table B-Tree
+        let result = BTree::create(
+            TreeType::Table,
+            Rc::clone(&pager),
+            4096,
+            0,
+            255, // max_payload_fraction (100%)
+            32,  // min_payload_fraction (12.5%)
+        );
+        
+        assert!(result.is_ok());
+        
+        let btree = result.unwrap();
+        assert_eq!(btree.tree_type, TreeType::Table);
+        
+        // Root page should exist and be a table leaf
+        let mut pager_ref = pager.borrow_mut();
+        let page = pager_ref.get_page(btree.root_page, Some(PageType::TableLeaf)).unwrap();
+        
+        match page {
+            Page::BTree(btree_page) => {
+                assert_eq!(btree_page.header.page_type, PageType::TableLeaf);
+                assert_eq!(btree_page.header.cell_count, 0);
+            },
+            _ => panic!("Expected BTree page"),
+        }
+    }
+
+    #[test]
+    fn test_create_index_btree() {
+        let pager = create_test_pager();
+        
+        // Create an index B-Tree
+        let result = BTree::create(
+            TreeType::Index,
+            Rc::clone(&pager),
+            4096,
+            0,
+            255, // max_payload_fraction (100%)
+            32,  // min_payload_fraction (12.5%)
+        );
+        
+        assert!(result.is_ok());
+        
+        let btree = result.unwrap();
+        assert_eq!(btree.tree_type, TreeType::Index);
+        
+        // Root page should exist and be an index leaf
+        let mut pager_ref = pager.borrow_mut();
+        let page = pager_ref.get_page(btree.root_page, Some(PageType::IndexLeaf)).unwrap();
+        
+        match page {
+            Page::BTree(btree_page) => {
+                assert_eq!(btree_page.header.page_type, PageType::IndexLeaf);
+                assert_eq!(btree_page.header.cell_count, 0);
+            },
+            _ => panic!("Expected BTree page"),
+        }
+    }
+
+    #[test]
+    fn test_open_btree() {
+        let pager = create_test_pager();
+        
+        // Create a B-Tree
+        let btree = BTree::create(
+            TreeType::Table,
+            Rc::clone(&pager),
+            4096,
+            0,
+            255, // max_payload_fraction (100%)
+            32,  // min_payload_fraction (12.5%)
+        ).unwrap();
+        
+        let root_page = btree.root_page;
+        
+        // Open the B-Tree
+        let opened_btree = BTree::open(
+            root_page,
+            TreeType::Table,
+            Rc::clone(&pager),
+            4096,
+            0,
+            255,
+            32,
+        ).unwrap();
+        
+        assert_eq!(opened_btree.root_page, root_page);
+        assert_eq!(opened_btree.tree_type, TreeType::Table);
+        
+        // Test opening with wrong tree type
+        let result = BTree::open(
+            root_page,
+            TreeType::Index,
+            Rc::clone(&pager),
+            4096,
+            0,
+            255,
+            32,
+        );
+        
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_insert_and_find_record() {
+        let pager = create_test_pager();
+        
+        // Create a table B-Tree
+        let mut btree = BTree::create(
+            TreeType::Table,
+            Rc::clone(&pager),
+            4096,
+            0,
+            255, // max_payload_fraction (100%)
+            32,  // min_payload_fraction (12.5%)
+        ).unwrap();
+        
+        // Create some records
+        let records = [
+            (1, create_test_record(vec![SqliteValue::Integer(42), SqliteValue::String("Record 1".to_string())])),
+            (2, create_test_record(vec![SqliteValue::Integer(43), SqliteValue::String("Record 2".to_string())])),
+            (3, create_test_record(vec![SqliteValue::Integer(44), SqliteValue::String("Record 3".to_string())])),
+        ];
+        
+        // Insert the records
+        for (rowid, record) in &records {
+            btree.insert(*rowid, record).unwrap();
+        }
+        
+        // Find the records
+        for (rowid, record) in &records {
+            let found = btree.find(*rowid).unwrap();
+            
+            assert!(found.is_some());
+            let found_record = found.unwrap();
+            
+            assert_eq!(found_record.len(), record.len());
+            
+            // Compare record values
+            for i in 0..record.len() {
+                match (&record.values[i], &found_record.values[i]) {
+                    (SqliteValue::Integer(a), SqliteValue::Integer(b)) => assert_eq!(a, b),
+                    (SqliteValue::String(a), SqliteValue::String(b)) => assert_eq!(a, b),
+                    _ => panic!("Records don't match"),
+                }
+            }
+        }
+        
+        // Try to find a non-existent record
+        let not_found = btree.find(999).unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_insert_many_records() {
+        let pager = create_test_pager();
+        
+        // Create a table B-Tree
+        let mut btree = BTree::create(
+            TreeType::Table,
+            Rc::clone(&pager),
+            4096,
+            0,
+            255, // max_payload_fraction (100%)
+            32,  // min_payload_fraction (12.5%)
+        ).unwrap();
+        
+        // Insert enough records to cause splits
+        let record_count = 100;
+        
+        for i in 1..=record_count {
+            let record = create_test_record(vec![
+                SqliteValue::Integer(i),
+                SqliteValue::String(format!("Record {}", i)),
+                // Add more data to make the record larger and cause splits faster
+                SqliteValue::Blob(vec![i as u8; 100]),
+            ]);
+            
+            btree.insert(i, &record).unwrap();
+        }
+        
+        // Verify all records can be found
+        for i in 1..=record_count {
+            let found = btree.find(i).unwrap();
+            assert!(found.is_some());
+            
+            let record = found.unwrap();
+            
+            // Verify the record content
+            match &record.values[0] {
+                SqliteValue::Integer(value) => assert_eq!(*value, i),
+                _ => panic!("Expected Integer"),
+            }
+            
+            match &record.values[1] {
+                SqliteValue::String(value) => assert_eq!(value, &format!("Record {}", i)),
+                _ => panic!("Expected String"),
+            }
+            
+            match &record.values[2] {
+                SqliteValue::Blob(value) => assert_eq!(value, &vec![i as u8; 100]),
+                _ => panic!("Expected Blob"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_delete_record() {
+        let pager = create_test_pager();
+        
+        // Create a table B-Tree
+        let mut btree = BTree::create(
+            TreeType::Table,
+            Rc::clone(&pager),
+            4096,
+            0,
+            255, // max_payload_fraction (100%)
+            32,  // min_payload_fraction (12.5%)
+        ).unwrap();
+        
+        // Insert some records
+        for i in 1..=10 {
+            let record = create_test_record(vec![
+                SqliteValue::Integer(i),
+                SqliteValue::String(format!("Record {}", i)),
+            ]);
+            
+            btree.insert(i, &record).unwrap();
+        }
+        
+        // Delete some records
+        assert!(btree.delete(3).unwrap()); // Existing record
+        assert!(btree.delete(7).unwrap()); // Existing record
+        assert!(!btree.delete(999).unwrap()); // Non-existent record
+        
+        // Verify that deleted records are gone
+        assert!(btree.find(3).unwrap().is_none());
+        assert!(btree.find(7).unwrap().is_none());
+        
+        // Verify that other records still exist
+        for i in [1, 2, 4, 5, 6, 8, 9, 10] {
+            assert!(btree.find(i).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn test_insert_and_find_index() {
+        let pager = create_test_pager();
+        
+        // Create an index B-Tree
+        let mut btree = BTree::create(
+            TreeType::Index,
+            Rc::clone(&pager),
+            4096,
+            0,
+            255, // max_payload_fraction (100%)
+            32,  // min_payload_fraction (12.5%)
+        ).unwrap();
+        
+        // Create some index entries
+        // For each key, we'll create payload that consists of the key followed by a rowid
+        let entries = [
+            (42, 1),
+            (43, 2),
+            (44, 3),
+        ];
+        
+        // Insert index entries
+        for (key, rowid) in &entries {
+            // Create payload for the index: the key in SQLite format
+            let mut key_payload = Vec::new();
+            crate::utils::serialization::serialize_values(
+                &[SqliteValue::Integer(*key)],
+                &mut key_payload
+            ).unwrap();
+            
+            btree.insert_index(&key_payload, *rowid).unwrap();
+        }
+        
+        // Find the index entries
+        for (key, _) in &entries {
+            let key_value = KeyValue::Integer(*key);
+            let (found, _, _) = btree.find_index_key(&key_value).unwrap();
+            
+            assert!(found, "Key {} should be found", key);
+        }
+        
+        // Try to find a non-existent key
+        let non_existent_key = KeyValue::Integer(999);
+        let (found, _, _) = btree.find_index_key(&non_existent_key).unwrap();
+        assert!(!found, "Key 999 should not be found");
+    }
+
+    #[test]
+    fn test_delete_index() {
+        let pager = create_test_pager();
+        
+        // Create an index B-Tree
+        let mut btree = BTree::create(
+            TreeType::Index,
+            Rc::clone(&pager),
+            4096,
+            0,
+            255, // max_payload_fraction (100%)
+            32,  // min_payload_fraction (12.5%)
+        ).unwrap();
+        
+        // Insert some index entries
+        for i in 1..=10 {
+            // Create payload for the index: the key in SQLite format
+            let mut key_payload = Vec::new();
+            crate::utils::serialization::serialize_values(
+                &[SqliteValue::Integer(i)],
+                &mut key_payload
+            ).unwrap();
+            
+            btree.insert_index(&key_payload, i).unwrap();
+        }
+        
+        // Delete some index entries
+        assert!(btree.delete_index(&KeyValue::Integer(3)).unwrap()); // Existing key
+        assert!(btree.delete_index(&KeyValue::Integer(7)).unwrap()); // Existing key
+        assert!(!btree.delete_index(&KeyValue::Integer(999)).unwrap()); // Non-existent key
+        
+        // Verify that deleted keys are gone
+        let (found3, _, _) = btree.find_index_key(&KeyValue::Integer(3)).unwrap();
+        assert!(!found3, "Key 3 should be deleted");
+        
+        let (found7, _, _) = btree.find_index_key(&KeyValue::Integer(7)).unwrap();
+        assert!(!found7, "Key 7 should be deleted");
+        
+        // Verify that other keys still exist
+        for i in [1, 2, 4, 5, 6, 8, 9, 10] {
+            let (found, _, _) = btree.find_index_key(&KeyValue::Integer(i)).unwrap();
+            assert!(found, "Key {} should still exist", i);
+        }
+    }
+
+    #[test]
+    fn test_overflow_chain() {
+        let pager = create_test_pager();
+        
+        // Create a table B-Tree
+        let mut btree = BTree::create(
+            TreeType::Table,
+            Rc::clone(&pager),
+            4096,
+            0,
+            255, // max_payload_fraction (100%)
+            32,  // min_payload_fraction (12.5%)
+        ).unwrap();
+        
+        // Create a record with a large payload to force overflow pages
+        let large_data = vec![0xAA; 10000]; // 10KB data, should require at least 2 overflow pages
+        let large_record = create_test_record(vec![
+            SqliteValue::Integer(1),
+            SqliteValue::Blob(large_data.clone()),
+        ]);
+        
+        // Insert the record
+        btree.insert(1, &large_record).unwrap();
+        
+        // Find the record
+        let found = btree.find(1).unwrap();
+        assert!(found.is_some());
+        
+        let record = found.unwrap();
+        assert_eq!(record.len(), 2);
+        
+        // Verify the large blob data
+        match &record.values[1] {
+            SqliteValue::Blob(data) => {
+                assert_eq!(data.len(), large_data.len());
+                assert_eq!(data, &large_data);
+            },
+            _ => panic!("Expected Blob"),
+        }
+    }
+}
