@@ -60,6 +60,17 @@ impl PageType {
         }
     }
 
+    pub fn to_byte(&self) -> u8 {
+        match self {
+            PageType::IndexInterior => 0x02,
+            PageType::TableInterior => 0x05,
+            PageType::IndexLeaf => 0x0A,
+            PageType::TableLeaf => 0x0D,
+            PageType::Overflow => 0x10,
+            PageType::Free => 0x00,
+        }
+    }
+
     /// Returns true if the page is an interior page.
     pub fn is_interior(&self) -> bool {
         matches!(self, PageType::IndexInterior | PageType::TableInterior)
@@ -356,6 +367,8 @@ impl BTreeCell {
         }
     }
 }
+
+
 
 /// Represents a B-Tree page.
 #[derive(Debug, Clone)]
@@ -789,7 +802,7 @@ impl ByteSerializable for BTreePage {
             let buffer_offset = cell_index - content_start;
             
             // We need to keep track of the size of the buffer.
-            let mut buffer_size = content_buffer.len();
+            let buffer_size = content_buffer.len();
 
             // Create a cursor at the cell position
             let mut cell_cursor = Cursor::new(&mut content_buffer[buffer_offset..]);
@@ -799,14 +812,15 @@ impl ByteSerializable for BTreePage {
                 BTreeCell::TableLeaf(leaf_cell) => {
                     // Write payload size
                     crate::utils::encode_varint(leaf_cell.payload_size as i64, &mut cell_cursor)?;
-                    buffer_size -= crate::utils::varint_size(leaf_cell.payload_size as i64);
+                
                     // Write rowid
                     crate::utils::encode_varint(leaf_cell.row_id, &mut cell_cursor)?;
-                    buffer_size -= crate::utils::varint_size(leaf_cell.row_id);
+               
                     // Write payload
                     let current_pos = cell_cursor.position() as usize;
                     let available_space = buffer_size - buffer_offset - current_pos;
                     let payload_size = leaf_cell.payload.len().min(available_space);
+                   
                     
                     if payload_size > 0 {
                         cell_cursor.write_all(&leaf_cell.payload[..payload_size])?;
@@ -827,7 +841,7 @@ impl ByteSerializable for BTreePage {
                 BTreeCell::IndexLeaf(leaf_cell) => {
                     // Write payload size
                     crate::utils::encode_varint(leaf_cell.payload_size as i64, &mut cell_cursor)?;
-                    buffer_size -= crate::utils::varint_size(leaf_cell.payload_size as i64);
+          
                     // Write payload
                     let current_pos = cell_cursor.position() as usize;
                     let available_space = buffer_size - buffer_offset - current_pos;
@@ -845,10 +859,10 @@ impl ByteSerializable for BTreePage {
                 BTreeCell::IndexInterior(interior_cell) => {
                     // Write left child page
                     cell_cursor.write_all(&interior_cell.left_child_page.to_be_bytes())?;
-                    buffer_size -= 4;
+                 
                     // Write payload size
                     crate::utils::encode_varint(interior_cell.payload_size as i64, &mut cell_cursor)?;
-                    buffer_size -= crate::utils::varint_size(interior_cell.payload_size as i64);
+                    
                     // Write payload
                     let current_pos = cell_cursor.position() as usize;
                     let available_space = buffer_size- buffer_offset - current_pos;
@@ -935,25 +949,42 @@ impl ByteSerializable for OverflowPage {
         // Read next page pointer
         let mut buffer = [0u8; 4];
         reader.read_exact(&mut buffer)?;
+
+
         let next_page = u32::from_be_bytes(buffer);
+
+        
+        // Read the page_size:
+        let mut buffer = [0u8; 4];
+        reader.read_exact(&mut buffer)?;
+        let page_size = u32::from_be_bytes(buffer);
+       
+        // Read the page_number:
+        let mut buffer = [0u8; 4];
+        reader.read_exact(&mut buffer)?;
+        let page_number = u32::from_be_bytes(buffer);
         
         // Read data
         let mut data = Vec::new();
         reader.read_to_end(&mut data)?;
         
         // Create overflow page
-        // Note: page_size and page_number need to be set by the caller
         Ok(OverflowPage {
             next_page,
             data,
-            page_size: 0,
-            page_number: 0,
+           page_size,
+           page_number,
         })
     }
 
     fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         // Write next page pointer
+        
         writer.write_all(&self.next_page.to_be_bytes())?;
+        // Write page size
+        writer.write_all(&self.page_size.to_be_bytes())?;
+        // Write page number
+        writer.write_all(&self.page_number.to_be_bytes())?;
         
         // Write data
         writer.write_all(&self.data)?;
@@ -1004,18 +1035,31 @@ impl ByteSerializable for FreePage {
         reader.read_exact(&mut buffer)?;
         let next_page = u32::from_be_bytes(buffer);
         
+        // Read the page size
+        let mut buffer = [0u8; 4];
+        reader.read_exact(&mut buffer)?;
+        let page_size = u32::from_be_bytes(buffer);
+
+        // Read the page number
+        let mut buffer = [0u8; 4];
+        reader.read_exact(&mut buffer)?;
+        let page_number = u32::from_be_bytes(buffer);
+
         // Create free page
-        // Note: page_size and page_number need to be set by the caller
         Ok(FreePage {
             next_page,
-            page_size: 0,
-            page_number: 0,
+            page_size,
+            page_number,
         })
     }
 
     fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         // Write next page pointer
         writer.write_all(&self.next_page.to_be_bytes())?;
+        // Write page size
+        writer.write_all(&self.page_size.to_be_bytes())?;
+        // Write page number
+        writer.write_all(&self.page_number.to_be_bytes())?;
         
         Ok(())
     }
@@ -1065,7 +1109,7 @@ impl ByteSerializable for Page {
             // B-Tree page types
             0x02 | 0x05 | 0x0A | 0x0D => {
                 // Put back the first byte
-                let mut combined_reader = std::io::Cursor::new(buffer.to_vec())
+                let mut combined_reader = Cursor::new(buffer.to_vec())
                     .chain(reader);
                     
                 // Parse as B-Tree page
@@ -1074,11 +1118,13 @@ impl ByteSerializable for Page {
             },
             // Overflow page
             0x10 => {
+               // Skip the first byte and parse as Overflow page
                 let overflow_page = OverflowPage::read_from(reader)?;
                 Ok(Page::Overflow(overflow_page))
             },
             // Free page
             0x00 => {
+            
                 let free_page = FreePage::read_from(reader)?;
                 Ok(Page::Free(free_page))
             },
@@ -1090,6 +1136,14 @@ impl ByteSerializable for Page {
     }
 
     fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        // Write the page type based on the enum variant
+        match self {
+            // No need to write the type, as it is already written in the header
+            Page::BTree(_btree_page) => Ok(()),// 
+            Page::Overflow(_overflow_page) =>writer.write_all(&[0x10]),
+            Page::Free(_free_page) => writer.write_all(&[0x00]),
+            
+        }?;
         match self {
             Page::BTree(btree_page) => btree_page.write_to(writer),
             Page::Overflow(overflow_page) => overflow_page.write_to(writer),
@@ -1113,7 +1167,7 @@ impl From<Page> for OverflowPage {
     fn from(page: Page) -> Self {
         match page {
             Page::Overflow(overflow_page) => overflow_page,
-            _ => panic!("Cannot Convert to OverflowPage: page is not of type Overflow"),
+            _ => panic!("Cannot convert to OverflowPage: page is not of type Overflow"),
         }
     }
 }
@@ -1188,7 +1242,7 @@ impl<'a> From<&'a mut Page> for &'a mut FreePage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    
 
     #[test]
     fn test_page_type_from_byte() {
@@ -1456,4 +1510,922 @@ mod tests {
         assert_eq!(overflow_page.page_size(), 4096);
         assert_eq!(free_page.page_size(), 4096);
     }
+
+
+    #[test]
+    fn test_page_type_conversion() {
+        // Convertir bytes a PageType
+        assert_eq!(PageType::from_byte(0x02), Some(PageType::IndexInterior));
+        assert_eq!(PageType::from_byte(0x05), Some(PageType::TableInterior));
+        assert_eq!(PageType::from_byte(0x0A), Some(PageType::IndexLeaf));
+        assert_eq!(PageType::from_byte(0x0D), Some(PageType::TableLeaf));
+        assert_eq!(PageType::from_byte(0x10), Some(PageType::Overflow));
+        assert_eq!(PageType::from_byte(0x00), Some(PageType::Free));
+        assert_eq!(PageType::from_byte(0xFF), None); // Valor inválido
+    }
+
+    #[test]
+    fn test_btree_page_serialization() {
+        // Crear una página BTree de tipo TableLeaf
+        let mut page = BTreePage::new(
+            PageType::TableLeaf,
+            4096,
+            1,
+            0,
+            None,
+        ).unwrap();
+        
+        // Crear y añadir algunas celdas
+        let cell1 = BTreeCell::TableLeaf(TableLeafCell {
+            payload_size: 10,
+            row_id: 1,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            overflow_page: None,
+        });
+        
+        let cell2 = BTreeCell::TableLeaf(TableLeafCell {
+            payload_size: 5,
+            row_id: 2,
+            payload: vec![11, 12, 13, 14, 15],
+            overflow_page: None,
+        });
+        
+        // Añadir las celdas a la página
+        page.add_cell(cell1.clone()).unwrap();
+        page.add_cell(cell2.clone()).unwrap();
+        
+        // Verificar el estado de la página antes de serializar
+        assert_eq!(page.header.cell_count, 2);
+        assert_eq!(page.cells.len(), 2);
+        assert_eq!(page.cell_indices.len(), 2);
+        
+        // Serializar la página
+        let mut buffer = Vec::new();
+        page.write_to(&mut buffer).unwrap();
+        
+        // Verificar que el buffer contiene datos (no está vacío)
+        assert!(!buffer.is_empty());
+        
+        
+        // Deserializar la página
+        let mut cursor = Cursor::new(buffer);
+        let read_page = BTreePage::read_from(&mut cursor).unwrap();
+        
+        // Verificar el estado de la página después de deserializar
+        assert_eq!(read_page.header.page_type, PageType::TableLeaf);
+        assert_eq!(read_page.header.cell_count, 2);
+        assert_eq!(read_page.cells.len(), 2);
+        assert_eq!(read_page.cell_indices.len(), 2);
+        
+        // Verificar las celdas
+        match &read_page.cells[0] {
+            BTreeCell::TableLeaf(leaf_cell) => {
+                assert_eq!(leaf_cell.payload_size, 10);
+                assert_eq!(leaf_cell.row_id, 1);
+                assert_eq!(leaf_cell.payload, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+                assert_eq!(leaf_cell.overflow_page, None);
+            },
+            _ => panic!("Se esperaba TableLeaf"),
+        }
+        
+        match &read_page.cells[1] {
+            BTreeCell::TableLeaf(leaf_cell) => {
+                assert_eq!(leaf_cell.payload_size, 5);
+                assert_eq!(leaf_cell.row_id, 2);
+                assert_eq!(leaf_cell.payload, vec![11, 12, 13, 14, 15]);
+                assert_eq!(leaf_cell.overflow_page, None);
+            },
+            _ => panic!("Se esperaba TableLeaf"),
+        }
+    }
+
+    #[test]
+    fn test_btree_interior_page_serialization() {
+        // Crear una página BTree de tipo TableInterior
+        let mut page = BTreePage::new(
+            PageType::TableInterior,
+            4096,
+            1,
+            0,
+            Some(0x12345678), // rightmost page
+        ).unwrap();
+        
+        // Crear y añadir algunas celdas
+        let cell1 = BTreeCell::TableInterior(TableInteriorCell {
+            left_child_page: 0x11111111,
+            key: 100,
+        });
+        
+        let cell2 = BTreeCell::TableInterior(TableInteriorCell {
+            left_child_page: 0x22222222,
+            key: 200,
+        });
+        
+        // Añadir las celdas a la página
+        page.add_cell(cell1.clone()).unwrap();
+        page.add_cell(cell2.clone()).unwrap();
+        
+        // Verificar el estado de la página antes de serializar
+        assert_eq!(page.header.cell_count, 2);
+        assert_eq!(page.cells.len(), 2);
+        assert_eq!(page.cell_indices.len(), 2);
+        assert_eq!(page.header.right_most_page, Some(0x12345678));
+        
+        // Serializar la página
+        let mut buffer = Vec::new();
+        page.write_to(&mut buffer).unwrap();
+        
+        // Verificar que el buffer contiene datos (no está vacío)
+        assert!(!buffer.is_empty());
+        
+        // Deserializar la página
+        let mut cursor = Cursor::new(buffer);
+        let read_page = BTreePage::read_from(&mut cursor).unwrap();
+        
+        // Verificar el estado de la página después de deserializar
+        assert_eq!(read_page.header.page_type, PageType::TableInterior);
+        assert_eq!(read_page.header.cell_count, 2);
+        assert_eq!(read_page.cells.len(), 2);
+        assert_eq!(read_page.cell_indices.len(), 2);
+        assert_eq!(read_page.header.right_most_page, Some(0x12345678));
+        
+        // Verificar las celdas
+        match &read_page.cells[0] {
+            BTreeCell::TableInterior(interior_cell) => {
+                assert_eq!(interior_cell.left_child_page, 0x11111111);
+                assert_eq!(interior_cell.key, 100);
+            },
+            _ => panic!("Se esperaba TableInterior"),
+        }
+        
+        match &read_page.cells[1] {
+            BTreeCell::TableInterior(interior_cell) => {
+                assert_eq!(interior_cell.left_child_page, 0x22222222);
+                assert_eq!(interior_cell.key, 200);
+            },
+            _ => panic!("Se esperaba TableInterior"),
+        }
+    }
+
+    #[test]
+    fn test_overflow_page_serialization() {
+        // Crear una página de overflow
+        let overflow_page = OverflowPage::new(
+            0x12345678, // next_page
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10], // data
+            4096, // page_size
+            2, // page_number
+        ).unwrap();
+        
+        // Serializar la página
+        let mut buffer = Vec::new();
+        overflow_page.write_to(&mut buffer).unwrap();
+        
+        // Verificar que el buffer contiene datos (no está vacío)
+        assert!(!buffer.is_empty());
+        
+      
+        // Deserializar la página
+        let mut cursor = Cursor::new(buffer);
+        let read_page = OverflowPage::read_from(&mut cursor).unwrap();
+        
+        // Verificar los valores
+        assert_eq!(read_page.next_page, 0x12345678);
+        assert_eq!(read_page.data, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn test_free_page_serialization() {
+        // Crear una página libre
+        let free_page = FreePage::new(
+            0x12345678, // next_page
+            4096, // page_size
+            3, // page_number
+        );
+        
+        // Serializar la página
+        let mut buffer = Vec::new();
+        free_page.write_to(&mut buffer).unwrap();
+        
+        // Verificar que el buffer contiene datos (no está vacío)
+        assert!(!buffer.is_empty());
+        
+        // Verificar que los primeros 4 bytes son el next_page
+        assert_eq!(
+            u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]),
+            0x12345678
+        );
+        
+        // Deserializar la página
+        let mut cursor = Cursor::new(buffer);
+        let read_page = FreePage::read_from(&mut cursor).unwrap();
+        
+        // Verificar los valores
+        assert_eq!(read_page.next_page, 0x12345678);
+    }
+
+    #[test]
+    fn test_page_enum_serialization() {
+        // 1. Crear una página BTree
+        let mut btree_page = BTreePage::new(
+            PageType::TableLeaf,
+            4096,
+            1,
+            0,
+            None,
+        ).unwrap();
+        
+        // Añadir una celda a la página BTree
+        let cell = BTreeCell::TableLeaf(TableLeafCell {
+            payload_size: 10,
+            row_id: 42,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            overflow_page: None,
+        });
+        
+        btree_page.add_cell(cell).unwrap();
+        
+        // Crear un Page::BTree
+        let page_btree = Page::BTree(btree_page);
+        
+        // Serializar la página
+        let mut buffer = Vec::new();
+        page_btree.write_to(&mut buffer).unwrap();
+        
+        // Verificar que el buffer contiene datos (no está vacío)
+        assert!(!buffer.is_empty());
+        
+        // Verificar que el primer byte corresponde a una página BTree
+        assert_eq!(buffer[0], 0x0D); // TableLeaf
+        
+        // Deserializar la página
+        let mut cursor = Cursor::new(buffer);
+        let read_page = Page::read_from(&mut cursor).unwrap();
+     
+        // Verificar el tipo
+        match &read_page {
+            Page::BTree(page) => {
+                assert_eq!(page.header.page_type, PageType::TableLeaf);
+                assert_eq!(page.header.cell_count, 1);
+            },
+            _ => panic!("Se esperaba Page::BTree"),
+        }
+        
+        // 2. Crear una página Overflow
+        let overflow_page = OverflowPage::new(
+            0x12345678, // next_page
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10], // data
+            4096, // page_size
+            2, // page_number
+        ).unwrap();
+        
+        // Crear un Page::Overflow
+        let page_overflow = Page::Overflow(overflow_page);
+ 
+        // Serializar la página
+        let mut buffer = Vec::new();
+        page_overflow.write_to(&mut buffer).unwrap();
+        
+       
+        // Verificar que el buffer contiene datos (no está vacío)
+        assert!(!buffer.is_empty());
+        
+        // Deserializar la página
+        let mut cursor = Cursor::new(buffer);
+        let read_overflow = Page::read_from(&mut cursor).unwrap();
+
+        if let Page::Overflow(overflow_page) = read_overflow {
+           
+            assert_eq!(overflow_page.next_page, 0x12345678);
+            assert_eq!(overflow_page.data, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        } else {
+            panic!("Se esperaba Page::Overflow");
+        }
+
+   
+        
+        // 3. Crear una página Free
+        let free_page = FreePage::new(
+            0x12345678, // next_page
+            4096, // page_size
+            3, // page_number
+        );
+
+        
+        // Crear un Page::Free
+        let page_free = Page::Free(free_page);
+        
+        
+        // Serializar la página
+        let mut buffer = Vec::new();
+        page_free.write_to(&mut buffer).unwrap();
+     
+
+        
+        // Verificar que el buffer contiene datos (no está vacío)
+        assert!(!buffer.is_empty());
+
+
+        
+        // Deserializar la página
+        let mut cursor = Cursor::new(buffer);
+        let read_free = Page::read_from(&mut cursor).unwrap();
+
+        if let Page::Free(free_page) = read_free {
+            assert_eq!(free_page.next_page, 0x12345678);
+            
+        } else {
+            panic!("Se esperaba Page::Free");
+        }
+     
+      
+    }
+
+    #[test]
+    fn test_page_from_conversions() {
+        // Crear páginas de diferentes tipos
+        let btree_page = BTreePage::new(
+            PageType::TableLeaf,
+            4096,
+            1,
+            0,
+            None,
+        ).unwrap();
+        
+        let overflow_page = OverflowPage::new(
+            0x12345678,
+            vec![1, 2, 3, 4, 5],
+            4096,
+            2,
+        ).unwrap();
+        
+        let free_page = FreePage::new(
+            0x12345678,
+            4096,
+            3,
+        );
+        
+        // Crear enums Page
+        let page_btree = Page::BTree(btree_page.clone());
+        let page_overflow = Page::Overflow(overflow_page.clone());
+        let page_free = Page::Free(free_page.clone());
+        
+        // Probar conversiones con &Page
+        let btree_ref: &BTreePage = (&page_btree).into();
+        let overflow_ref: &OverflowPage = (&page_overflow).into();
+        let free_ref: &FreePage = (&page_free).into();
+        
+        assert_eq!(btree_ref.page_number, 1);
+        assert_eq!(overflow_ref.page_number, 2);
+        assert_eq!(free_ref.page_number, 3);
+        
+        // Probar conversiones con Page (consume)
+        let btree_owned: BTreePage = page_btree.into();
+        let overflow_owned: OverflowPage = page_overflow.into();
+        let free_owned: FreePage = page_free.into();
+        
+        assert_eq!(btree_owned.page_number, 1);
+        assert_eq!(overflow_owned.page_number, 2);
+        assert_eq!(free_owned.page_number, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot convert to BTreePage: page is not of type BTree")]
+    fn test_invalid_page_conversion_btree() {
+        let free_page = FreePage::new(0, 4096, 1);
+        let page = Page::Free(free_page);
+        
+        // Esta conversión debería fallar y causar un panic
+        let _: BTreePage = page.into();
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot convert to OverflowPage: page is not of type Overflow")]
+    fn test_invalid_page_conversion_overflow() {
+        let free_page = FreePage::new(0, 4096, 1);
+        let page = Page::Free(free_page);
+        
+        // Esta conversión debería fallar y causar un panic
+        let _: OverflowPage = page.into();
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot convert to FreePage: page is not of type Free")]
+    fn test_invalid_page_conversion_free() {
+        let btree_page = BTreePage::new(PageType::TableLeaf, 4096, 1, 0, None).unwrap();
+        let page = Page::BTree(btree_page);
+        
+        // Esta conversión debería fallar y causar un panic
+        let _: FreePage = page.into();
+    }
+    #[test]
+    fn test_btree_page_add_cell_validation() {
+        // Crear una página BTree de tipo TableLeaf
+        let mut page = BTreePage::new(
+            PageType::TableLeaf,
+            4096,
+            1,
+            0,
+            None,
+        ).unwrap();
+        
+        // Intentar añadir una celda de tipo incorrecto (TableInterior)
+        let wrong_cell = BTreeCell::TableInterior(TableInteriorCell {
+            left_child_page: 0x12345678,
+            key: 42,
+        });
+        
+        let result = page.add_cell(wrong_cell);
+        assert!(result.is_err());
+        
+        // Verificar el mensaje de error
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("Cell type incompatible with this page"));
+        
+        // Crear una celda de tipo correcto (TableLeaf)
+        let correct_cell = BTreeCell::TableLeaf(TableLeafCell {
+            payload_size: 10,
+            row_id: 42,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            overflow_page: None,
+        });
+        
+        // Añadir la celda correcta
+        let result = page.add_cell(correct_cell);
+        assert!(result.is_ok());
+    }
+    
+
+    #[test]
+    fn test_btree_page_with_reserved_space() {
+        // Crear una página BTree con espacio reservado
+        let reserved_space = 100;
+        let mut page = BTreePage::new(
+            PageType::TableLeaf,
+            4096,
+            1,
+            reserved_space,
+            None,
+        ).unwrap();
+        
+        // Verificar que el content_start_offset respeta el espacio reservado
+        assert_eq!(page.header.content_start_offset, 4096 - reserved_space as u16);
+        
+        // Añadir una celda
+        let cell = BTreeCell::TableLeaf(TableLeafCell {
+            payload_size: 10,
+            row_id: 42,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            overflow_page: None,
+        });
+        
+        page.add_cell(cell).unwrap();
+        
+        // Serializar la página
+        let mut buffer = Vec::new();
+        page.write_to(&mut buffer).unwrap();
+        
+        // Verificar que el buffer tiene el tamaño correcto
+        assert!(!buffer.is_empty());
+        assert_eq!(buffer.len(), 4096);
+        
+        // Deserializar la página
+        let mut cursor = Cursor::new(buffer);
+        let read_page = BTreePage::read_from(&mut cursor).unwrap();
+        
+        // Verificar que se preserva el content_start_offset
+        assert_eq!(read_page.header.content_start_offset, page.header.content_start_offset);
+    }
+
+    #[test]
+    fn test_multiple_page_roundtrip_serialization() {
+        // Crear páginas de todos los tipos
+        
+        // 1. BTree TableLeaf
+        let mut table_leaf = BTreePage::new(
+            PageType::TableLeaf,
+            4096,
+            1,
+            0,
+            None,
+        ).unwrap();
+        
+        // Añadir una celda
+        let leaf_cell = BTreeCell::TableLeaf(TableLeafCell {
+            payload_size: 10,
+            row_id: 42,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            overflow_page: None,
+        });
+        
+        table_leaf.add_cell(leaf_cell).unwrap();
+        
+        // 2. BTree TableInterior
+        let mut table_interior = BTreePage::new(
+            PageType::TableInterior,
+            4096,
+            2,
+            0,
+            Some(0x12345678),
+        ).unwrap();
+        
+        // Añadir una celda
+        let interior_cell = BTreeCell::TableInterior(TableInteriorCell {
+            left_child_page: 0x11111111,
+            key: 100,
+        });
+        
+        table_interior.add_cell(interior_cell).unwrap();
+        
+        // 3. BTree IndexLeaf
+        let mut index_leaf = BTreePage::new(
+            PageType::IndexLeaf,
+            4096,
+            3,
+            0,
+            None,
+        ).unwrap();
+        
+        // Añadir una celda
+        let index_leaf_cell = BTreeCell::IndexLeaf(IndexLeafCell {
+            payload_size: 10,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            overflow_page: None,
+        });
+        
+        index_leaf.add_cell(index_leaf_cell).unwrap();
+        
+        // 4. BTree IndexInterior
+        let mut index_interior = BTreePage::new(
+            PageType::IndexInterior,
+            4096,
+            4,
+            0,
+            Some(0x87654321),
+        ).unwrap();
+        
+        // Añadir una celda
+        let index_interior_cell = BTreeCell::IndexInterior(IndexInteriorCell {
+            left_child_page: 0x22222222,
+            payload_size: 10,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            overflow_page: None,
+        });
+        
+        index_interior.add_cell(index_interior_cell).unwrap();
+        
+        // 5. Overflow Page
+        let overflow = OverflowPage::new(
+            1,
+            vec![1, 2, 3, 4, 5],
+            4096,
+            5,
+        ).unwrap();
+        
+        // 6. Free Page
+        let free = FreePage::new(
+            1,
+            4096,
+            6,
+        );
+        
+        // Crear enums Page
+        let pages = vec![
+            Page::BTree(table_leaf),
+            Page::BTree(table_interior),
+            Page::BTree(index_leaf),
+            Page::BTree(index_interior),
+            Page::Overflow(overflow),
+            Page::Free(free),
+        ];
+        
+        // Serializar y deserializar cada página
+        for (i, page) in pages.iter().enumerate() {
+            let mut buffer = Vec::new();
+            page.write_to(&mut buffer).unwrap();
+            if i == 4 {
+                println!("Page 4: {:?}", page);
+
+            }
+            // Verificar que el buffer no está vacío
+            assert!(!buffer.is_empty());
+            
+            // Deserializar la página
+            let mut cursor = Cursor::new(&buffer[..]);
+            let read_page = Page::read_from(&mut cursor).unwrap();
+            if i == 4 {
+                println!("Read Page 4: {:?}", read_page);
+            }
+            // Verificar que es del mismo tipo
+            match (page, &read_page) {
+                (Page::BTree(_), Page::BTree(_)) => {},
+                (Page::Overflow(_), Page::Overflow(_)) => {},
+                (Page::Free(_), Page::Free(_)) => {},
+                _ => panic!("Tipo de página incorrecto para el índice {}", i),
+            }
+            
+            // Verificar propiedades específicas según el tipo
+            match &read_page {
+                Page::BTree(btree_page) => {
+                    match i {
+                        0 => assert_eq!(btree_page.header.page_type, PageType::TableLeaf),
+                        1 => assert_eq!(btree_page.header.page_type, PageType::TableInterior),
+                        2 => assert_eq!(btree_page.header.page_type, PageType::IndexLeaf),
+                        3 => assert_eq!(btree_page.header.page_type, PageType::IndexInterior),
+                        _ => panic!("Índice inesperado"),
+                    }
+                },
+                Page::Overflow(_) => assert_eq!(i, 4),
+                Page::Free(_) => assert_eq!(i, 5),
+            }
+        }
+    }
+
+
+    #[test]
+    fn test_page_getters() {
+        // Crear páginas de diferentes tipos
+        let btree_page = BTreePage::new(
+            PageType::TableLeaf,
+            4096,
+            1,
+            0,
+            None,
+        ).unwrap();
+        
+        let overflow_page = OverflowPage::new(
+            0,
+            vec![1, 2, 3],
+            4096,
+            2,
+        ).unwrap();
+        
+        let free_page = FreePage::new(
+            0,
+            4096,
+            3,
+        );
+        
+        // Crear enums Page
+        let page_btree = Page::BTree(btree_page);
+        let page_overflow = Page::Overflow(overflow_page);
+        let page_free = Page::Free(free_page);
+        
+        // Probar el método page_number()
+        assert_eq!(page_btree.page_number(), 1);
+        assert_eq!(page_overflow.page_number(), 2);
+        assert_eq!(page_free.page_number(), 3);
+        
+        // Probar el método page_size()
+        assert_eq!(page_btree.page_size(), 4096);
+        assert_eq!(page_overflow.page_size(), 4096);
+        assert_eq!(page_free.page_size(), 4096);
+    }
+
+    #[test]
+    fn test_btree_page_with_sqlite_values() {
+        use crate::utils::serialization::{SqliteValue, serialize_values};
+        
+        // Crear una página BTree de tipo TableLeaf
+        let mut page = BTreePage::new(
+            PageType::TableLeaf,
+            4096,
+            1,
+            0,
+            None,
+        ).unwrap();
+        
+        // Crear un conjunto de valores SQLite
+        let values = vec![
+            SqliteValue::Integer(42),
+            SqliteValue::String("Hello, SQLite!".to_string()),
+            SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            SqliteValue::Float(std::f64::consts::PI),
+            SqliteValue::Null,
+        ];
+        
+        // Serializar los valores a un payload
+        let mut payload = Vec::new();
+        serialize_values(&values, &mut payload).unwrap();
+        
+        // Crear una celda con el payload
+        let cell = BTreeCell::TableLeaf(TableLeafCell {
+            payload_size: payload.len() as u64,
+            row_id: 1,
+            payload: payload.clone(),
+            overflow_page: None,
+        });
+        
+        // Añadir la celda a la página
+        page.add_cell(cell).unwrap();
+        
+        // Serializar la página
+        let mut buffer = Vec::new();
+        page.write_to(&mut buffer).unwrap();
+        
+        // Deserializar la página
+        let mut cursor = Cursor::new(buffer);
+        let read_page = BTreePage::read_from(&mut cursor).unwrap();
+        
+        // Verificar que la celda fue recuperada correctamente
+        assert_eq!(read_page.cells.len(), 1);
+        
+        match &read_page.cells[0] {
+            BTreeCell::TableLeaf(leaf_cell) => {
+                assert_eq!(leaf_cell.row_id, 1);
+                assert_eq!(leaf_cell.payload_size as usize, payload.len());
+                assert_eq!(leaf_cell.payload, payload);
+            },
+            _ => panic!("Se esperaba TableLeaf"),
+        }
+    }
+
+    
+    #[test]
+    fn test_btree_cell_size() {
+        // Probar TableLeaf sin overflow
+        let cell = BTreeCell::TableLeaf(TableLeafCell {
+            payload_size: 10,
+            row_id: 42,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            overflow_page: None,
+        });
+        
+        // Tamaño = varint(payload_size) + varint(row_id) + payload.len()
+        let expected_size = crate::utils::varint_size(10) + crate::utils::varint_size(42) + 10;
+        assert_eq!(cell.size(), expected_size);
+        
+        // Probar TableLeaf con overflow
+        let cell_with_overflow = BTreeCell::TableLeaf(TableLeafCell {
+            payload_size: 10,
+            row_id: 42,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            overflow_page: Some(0x12345678),
+        });
+        
+        // Tamaño = varint(payload_size) + varint(row_id) + payload.len() + 4 (overflow_page)
+        let expected_size = crate::utils::varint_size(10) + crate::utils::varint_size(42) + 10 + 4;
+        assert_eq!(cell_with_overflow.size(), expected_size);
+        
+        // Probar TableInterior
+        let interior_cell = BTreeCell::TableInterior(TableInteriorCell {
+            left_child_page: 0x12345678,
+            key: 42,
+        });
+        
+        // Tamaño = 4 (left_child_page) + varint(key)
+        let expected_size = 4 + crate::utils::varint_size(42);
+        assert_eq!(interior_cell.size(), expected_size);
+        
+        // Probar IndexLeaf sin overflow
+        let index_leaf = BTreeCell::IndexLeaf(IndexLeafCell {
+            payload_size: 10,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            overflow_page: None,
+        });
+        
+        // Tamaño = varint(payload_size) + payload.len()
+        let expected_size = crate::utils::varint_size(10) + 10;
+        assert_eq!(index_leaf.size(), expected_size);
+        
+        // Probar IndexLeaf con overflow
+        let index_leaf_overflow = BTreeCell::IndexLeaf(IndexLeafCell {
+            payload_size: 10,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            overflow_page: Some(0x12345678),
+        });
+        
+        // Tamaño = varint(payload_size) + payload.len() + 4 (overflow_page)
+        let expected_size = crate::utils::varint_size(10) + 10 + 4;
+        assert_eq!(index_leaf_overflow.size(), expected_size);
+        
+        // Probar IndexInterior sin overflow
+        let index_interior = BTreeCell::IndexInterior(IndexInteriorCell {
+            left_child_page: 0x12345678,
+            payload_size: 10,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            overflow_page: None,
+        });
+        
+        // Tamaño = 4 (left_child_page) + varint(payload_size) + payload.len()
+        let expected_size = 4 + crate::utils::varint_size(10) + 10;
+        assert_eq!(index_interior.size(), expected_size);
+        
+        // Probar IndexInterior con overflow
+        let index_interior_overflow = BTreeCell::IndexInterior(IndexInteriorCell {
+            left_child_page: 0x12345678,
+            payload_size: 10,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            overflow_page: Some(0x12345678),
+        });
+        
+        // Tamaño = 4 (left_child_page) + varint(payload_size) + payload.len() + 4 (overflow_page)
+        let expected_size = 4 + crate::utils::varint_size(10) + 10 + 4;
+        assert_eq!(index_interior_overflow.size(), expected_size);
+    }
+    
+    
+    #[test]
+    fn test_overflow_page_with_large_data() {
+        // Crear una página con datos grandes pero dentro del límite
+        let max_data_size = 4096 - 4; // 4096 (tamaño de página) - 4 (next_page)
+        let data = vec![0; max_data_size];
+        
+        let page_result = OverflowPage::new(0, data.clone(), 4096, 1);
+        assert!(page_result.is_ok());
+        
+        let page = page_result.unwrap();
+        assert_eq!(page.data.len(), max_data_size);
+        
+        // Intentar crear una página con datos que exceden el límite
+        let too_large_data = vec![0; max_data_size + 1];
+        
+        let page_result = OverflowPage::new(0, too_large_data, 4096, 1);
+        assert!(page_result.is_err());
+        
+        // Verificar el mensaje de error
+        let error = page_result.unwrap_err();
+        assert!(error.to_string().contains("Data too big for the overflow page"));
+    }
+    
+    #[test]
+    fn test_btree_page_update_content_start_offset() {
+        // Crear una página BTree vacía
+        let mut page = BTreePage::new(
+            PageType::TableLeaf,
+            4096,
+            1,
+            0,
+            None,
+        ).unwrap();
+        
+        // La página debe tener un content_start_offset igual al tamaño de página
+        assert_eq!(page.header.content_start_offset, 4096);
+        
+        // Simular una actualización del content_start_offset para representar contenido añadido
+        page.update_content_start_offset();
+        
+        // El offset debe seguir siendo igual al tamaño de página sin reserved_space
+        assert_eq!(page.header.content_start_offset, 4096);
+        
+        // Probar con reserved_space
+        let mut page_with_reserved = BTreePage::new(
+            PageType::TableLeaf,
+            4096,
+            1,
+            100, // 100 bytes de espacio reservado
+            None,
+        ).unwrap();
+        
+        // La página debe tener un content_start_offset que tenga en cuenta el espacio reservado
+        assert_eq!(page_with_reserved.header.content_start_offset, 4096 - 100);
+        
+        // Actualizar y verificar que se mantiene correcto
+        page_with_reserved.update_content_start_offset();
+        assert_eq!(page_with_reserved.header.content_start_offset, 4096 - 100);
+    }
+    
+    
+    
+    #[test]
+    fn test_page_number_and_size_getters() {
+        // Crear páginas de diferentes tipos
+        let btree_page = BTreePage::new(
+            PageType::TableLeaf,
+            4096,
+            1,
+            0,
+            None,
+        ).unwrap();
+        
+        let overflow_page = OverflowPage::new(
+            0,
+            vec![1, 2, 3],
+            4096,
+            2,
+        ).unwrap();
+        
+        let free_page = FreePage::new(
+            0,
+            4096,
+            3,
+        );
+        
+        // Crear enums Page
+        let page_btree = Page::BTree(btree_page);
+        let page_overflow = Page::Overflow(overflow_page);
+        let page_free = Page::Free(free_page);
+        
+        // Probar el método page_number()
+        assert_eq!(page_btree.page_number(), 1);
+        assert_eq!(page_overflow.page_number(), 2);
+        assert_eq!(page_free.page_number(), 3);
+        
+        // Probar el método page_size()
+        assert_eq!(page_btree.page_size(), 4096);
+        assert_eq!(page_overflow.page_size(), 4096);
+        assert_eq!(page_free.page_size(), 4096);
+    }
+
+    
 }
