@@ -90,6 +90,17 @@ impl PageType {
     }
 }
 
+
+/// Custom trait for serializing and deserializing data to and from byte streams.
+/// This trait is used to read and write data in a binary format.
+/// It is implemented for various types, including B-Tree page headers and cells.
+pub trait ByteSerializable {
+    /// Reads a value from a byte stream.
+    fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> where Self: Sized;
+    /// Writes a value to a byte stream.
+    fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()>;
+}
+
 /// Represents the header of a B-Tree page.
 #[derive(Debug, Clone)]
 pub struct BTreePageHeader {
@@ -157,13 +168,16 @@ impl BTreePageHeader {
             12 //For interior pages we need to add the right_most_page (4)
         }
     }
+}
 
+
+impl ByteSerializable for BTreePageHeader {
     /// Reads a header from a source, which must implement the trait Read.
     /// # Parameters
     /// * `reader` - Source from which to read the header.
     /// # Errors
     /// Returns an error if the header cannot be read or if the page type is unknown.
-    pub fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
+    fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
         let mut buffer = [0u8; 12]; // Buffer to read the header
         reader.read_exact(&mut buffer[0..1])?; // Read the page type
 
@@ -206,7 +220,7 @@ impl BTreePageHeader {
     /// # Errors
     /// Returns an error if the header cannot be written.
     /// 
-    pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+    fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         // Write the page type
         writer.write_all(&[self.page_type as u8])?;
 
@@ -242,6 +256,9 @@ impl fmt::Display for BTreePageHeader {
     }
 }
 
+
+
+
 /// Each cell on a B-Tree page can be of different types.
 /// Table leaf cells is where the actual data is stored.
 #[derive(Debug, Clone)]
@@ -255,6 +272,7 @@ pub struct TableLeafCell {
     /// Pointer to the overflow page that stores therest of the data if it does not fit in this page.
     pub overflow_page: Option<u32>,
 }
+
 
 /// Table interior cells are used to store the keys that define the boundaries between child pages.
 /// Used for efficient searching and navigation in the B-Tree structure.
@@ -338,6 +356,94 @@ impl BTreeCell {
     }
 }
 
+impl ByteSerializable for BTreeCell {
+
+    fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        let mut buffer = vec![0u8; self.size()];
+        match self {
+            BTreeCell::TableLeaf(leaf_cell) => {
+                let mut cell_cursor = std::io::Cursor::new(&mut buffer[0..]);
+                // Write payload size as varint
+                crate::utils::encode_varint(leaf_cell.payload_size as i64, &mut cell_cursor)?;
+                
+                // Write rowid as varint
+                crate::utils::encode_varint(leaf_cell.row_id, &mut cell_cursor)?;
+                
+                // Calculate current position
+                let pos = cell_cursor.position() as usize;
+                
+                // Write payload
+                let payload_size = leaf_cell.payload.len();
+                buffer[0 + pos..0 + pos + payload_size]
+                    .copy_from_slice(&leaf_cell.payload);
+                
+                // Write overflow page if present
+                if let Some(overflow_page) = leaf_cell.overflow_page {
+                    let overflow_offset = 0 + pos + payload_size;
+                    buffer[overflow_offset..overflow_offset + 4]
+                        .copy_from_slice(&overflow_page.to_be_bytes());
+                }
+            },
+            BTreeCell::TableInterior(interior_cell) => {
+                let mut cell_cursor = std::io::Cursor::new(&mut buffer[0..]);
+                
+                // Write left child page
+                cell_cursor.write_all(&interior_cell.left_child_page.to_be_bytes())?;
+                
+                // Write key as varint
+                crate::utils::encode_varint(interior_cell.key, &mut cell_cursor)?;
+            },
+            BTreeCell::IndexLeaf(leaf_cell) => {
+                let mut cell_cursor = std::io::Cursor::new(&mut buffer[0..]);
+                
+                // Write payload size as varint
+                crate::utils::encode_varint(leaf_cell.payload_size as i64, &mut cell_cursor)?;
+                
+                // Calculate current position
+                let pos = cell_cursor.position() as usize;
+                
+                // Write payload
+                let payload_size = leaf_cell.payload.len();
+                buffer[0 + pos..0 + pos + payload_size]
+                    .copy_from_slice(&leaf_cell.payload);
+                
+                // Write overflow page if present
+                if let Some(overflow_page) = leaf_cell.overflow_page {
+                    let overflow_offset = 0 + pos + payload_size;
+                    buffer[overflow_offset..overflow_offset + 4]
+                        .copy_from_slice(&overflow_page.to_be_bytes());
+                }
+            },
+            BTreeCell::IndexInterior(interior_cell) => {
+                let mut cell_cursor = std::io::Cursor::new(&mut buffer[0..]);
+                
+                // Write left child page
+                cell_cursor.write_all(&interior_cell.left_child_page.to_be_bytes())?;
+                
+                // Write payload size as varint
+                crate::utils::encode_varint(interior_cell.payload_size as i64, &mut cell_cursor)?;
+                
+                // Calculate current position
+                let pos = cell_cursor.position() as usize;
+                
+                // Write payload
+                let payload_size = interior_cell.payload.len();
+                buffer[0 + pos..0 + pos + payload_size]
+                    .copy_from_slice(&interior_cell.payload);
+                
+                // Write overflow page if present
+                if let Some(overflow_page) = interior_cell.overflow_page {
+                    let overflow_offset = 0 + pos + payload_size;
+                    buffer[overflow_offset..overflow_offset + 4]
+                        .copy_from_slice(&overflow_page.to_be_bytes());
+                }
+            },
+    }
+    Ok(())
+
+}
+
+}
 /// Represents a B-Tree page.
 #[derive(Debug, Clone)]
 pub struct BTreePage {
@@ -383,15 +489,16 @@ impl BTreePage {
                 ));
             }
             BTreePageHeader::new_leaf(page_type) // Create a new leaf page header
-        } else {
-            if let Some(right_most) = right_most_page {
+        } else if let Some(right_most) = right_most_page  {
+         
                 BTreePageHeader::new_interior(page_type, right_most)
+            
             } else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "The right_most_page should be set for interior pages",
                 ));
-            }
+            
         };
 
         // Initialize the B-Tree page
@@ -501,6 +608,13 @@ impl BTreePage {
         self.page_size as usize - used_space - content_size - self.reserved_space as usize
     }
 }
+
+
+
+
+
+
+
 
 /// Represents an overflow page.
 #[derive(Debug, Clone)]

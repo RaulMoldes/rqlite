@@ -11,6 +11,21 @@
 //! - `BLOB`: Represents binary data.
 //! - `STRING`: Represents UTF-8 encoded strings.
 //! 
+//! 
+//! //! Notes on SQLITE Data Types:
+//! - SQLite uses dynamic typing, meaning that the type of a value is determined by its content rather than its declared type.
+//! - The INTEGER types are used to store signed integers of various sizes.
+//! - The BLOB type is used to store binary data, while the STRING type is used for UTF-8 encoded strings.
+//! - The NULL type represents a null value.
+//! - The INTEGER0 and INTEGER1 types are used to represent boolean values (false and true, respectively).
+//!
+//! Database engines that implement rigid typing (like PostgreSQL) may not support all SQLite types.
+//! Affinity rules for columns in SQLite determine how values are stored and retrieved.
+//! If the declared type contains the string "INT" then it is assigned INTEGER affinity.
+//! If the declared type of the column contains any of the strings "CHAR", "CLOB", or "TEXT" then that column has TEXT affinity. Notice that the type VARCHAR contains the string "CHAR" and is thus assigned TEXT affinity.
+//! If the declared type for a column contains the string "BLOB" or if no type is specified then the column has affinity BLOB.
+//! If the declared type for a column contains any of the strings "REAL", "FLOA", or "DOUB" then the column has REAL affinity.
+//! Otherwise, the affinity is NUMERIC.
 
 use std::io::{self, Read, Write};
 use super::varint::{encode_varint, decode_varint};
@@ -51,21 +66,7 @@ pub enum SqliteType {
     String = 13,
 }
 
-///! Notes on SQLITE Data Types:
-/// //! - SQLite uses dynamic typing, meaning that the type of a value is determined by its content rather than its declared type.
-/// //! - The INTEGER types are used to store signed integers of various sizes.
-/// //! - The BLOB type is used to store binary data, while the STRING type is used for UTF-8 encoded strings.
-///! - The NULL type represents a null value.
-///! - The INTEGER0 and INTEGER1 types are used to represent boolean values (false and true, respectively).
 
-/// Database engines that implement rigid typing (like PostgreSQL) may not support all SQLite types.
-///! Affinity rules for columns in SQLite determine how values are stored and retrieved.
-///! If the declared type contains the string "INT" then it is assigned INTEGER affinity.
-///! If the declared type of the column contains any of the strings "CHAR", "CLOB", or "TEXT" then that column has TEXT affinity. Notice that the type VARCHAR contains the string "CHAR" and is thus assigned TEXT affinity.
-///! If the declared type for a column contains the string "BLOB" or if no type is specified then the column has affinity BLOB.
-///! If the declared type for a column contains any of the strings "REAL", "FLOA", or "DOUB" then the column has REAL affinity.
-///! Otherwise, the affinity is NUMERIC.
-/// 
 /// In SQLite, the difference between NUMERIC and INTEGER is only important on a cast expression, but it does not affect how the values are stores under the hood.
 /// 
 /// Note that on my implementation I am not using the SQLite rules for type affinity.
@@ -74,8 +75,6 @@ pub enum SqliteType {
 /// 
 /// For DateTime values, SQLite does not have a specific type. Instead, it uses built in functions that can convert from REAL, INTEGER or TEXT to DATE.
 /// As I said, I am not implementing that part of the functionality.
-
-
 /// Conversion from u8 to SqliteType
 impl From<u8> for SqliteType {
     fn from(value: u8) -> Self {
@@ -542,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_sqlite_value_float() {
-        let test_values = [0.0, 1.0, -1.0, 3.14159, -3.14159, f64::MAX, f64::MIN, f64::NAN];
+        let test_values = [0.0, 1.0, -1.0, std::f64::consts::PI, -std::f64::consts::PI, f64::MAX, f64::MIN, f64::NAN];
         
         for &float_value in &test_values {
             let value = SqliteValue::Float(float_value);
@@ -632,7 +631,7 @@ mod tests {
         let values = vec![
             SqliteValue::Null,
             SqliteValue::Integer(42),
-            SqliteValue::Float(3.14159),
+            SqliteValue::Float(std::f64::consts::PI),
             SqliteValue::Blob(vec![1, 2, 3]),
             SqliteValue::String("Hello, SQLite!".to_string()),
         ];
