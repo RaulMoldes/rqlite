@@ -27,7 +27,7 @@ use std::io::Cursor;
 /// 
 /// # Errors
 /// Returns an error if the payload cannot be parsed
-fn extract_key_from_payload(payload: &[u8]) -> io::Result<KeyValue> {
+pub fn extract_key_from_payload(payload: &[u8]) -> io::Result<KeyValue> {
     use crate::utils::serialization::{SqliteValue, deserialize_values};
     
     // Parse the payload as SQLite values
