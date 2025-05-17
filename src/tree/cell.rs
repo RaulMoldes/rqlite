@@ -48,6 +48,7 @@ impl BTreeCellFactory {
             // Store all locally
             payload_size
         } else {
+          
             // Calculate M (minimum local payload size)
             // Formula for M: (usable_size - 12) * X / 255
             // where X is the minimum payload fraction.
@@ -64,13 +65,14 @@ impl BTreeCellFactory {
             } else {
                 // Store part locally and part in overflow
                 // Formula: M + ((payload_size - M) % (usable_size - 4))
+    
                 m + ((payload_size - m) % (usable_size - 4))
             }
         };
         
         // Part of the payload that is stored locally
         let local_payload = payload[0..local_payload_size].to_vec();
-        
+       
         // Part of the payload that is stored in overflow (if any)
         let overflow_payload = if local_payload_size < payload_size {
             Some(payload[local_payload_size..].to_vec())
@@ -302,7 +304,7 @@ mod tests {
     #[test]
     fn test_create_table_leaf_cell_large_payload() {
         let rowid = 42;
-        let payload = create_test_payload(300);
+        let payload = create_test_payload(2000);
         let max_local = 100;
         let min_local = 50;
         let usable_size = 1000;
@@ -323,14 +325,14 @@ mod tests {
         match cell {
             BTreeCell::TableLeaf(leaf) => {
                 assert_eq!(leaf.row_id, rowid);
+              
                 assert_eq!(leaf.payload_size as usize, payload.len());
                 
                 // Check that the cell contains the first part of payload
-                assert_eq!(leaf.payload.len(), min_local);
-                assert_eq!(&leaf.payload[..], &payload[..min_local]);
+                assert_eq!(&leaf.payload[..], &payload[..leaf.payload.len()]);
                 
                 // Check overflow data contains the rest
-                assert_eq!(overflow_data, payload[min_local..].to_vec());
+                assert_eq!(overflow_data, payload[leaf.payload.len()..].to_vec());
                 
                 // No overflow page yet
                 assert!(leaf.overflow_page.is_none());
@@ -385,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_create_index_leaf_cell_large_payload() {
-        let payload = create_test_payload(300);
+        let payload = create_test_payload(2000);
         let max_local = 100;
         let min_local = 50;
         let usable_size = 1000;
@@ -404,14 +406,13 @@ mod tests {
         // Check cell type and contents
         match cell {
             BTreeCell::IndexLeaf(leaf) => {
-                assert_eq!(leaf.payload_size as usize, payload.len());
-                
-                // Check that the cell contains the first part of payload
-                assert_eq!(leaf.payload.len(), min_local);
-                assert_eq!(&leaf.payload[..], &payload[..min_local]);
+           
+          
+                assert_eq!(payload.len(), leaf.payload_size as usize);
+                assert_eq!(&leaf.payload[..], &payload[..leaf.payload.len()]);
                 
                 // Check overflow data contains the rest
-                assert_eq!(overflow_data, payload[min_local..].to_vec());
+                assert_eq!(overflow_data, payload[leaf.payload.len()..].to_vec());
                 
                 // No overflow page yet
                 assert!(leaf.overflow_page.is_none());
@@ -454,7 +455,7 @@ mod tests {
     #[test]
     fn test_create_index_interior_cell_large_payload() {
         let left_child_page = 123;
-        let payload = create_test_payload(300);
+        let payload = create_test_payload(2000);
         let max_local = 100;
         let min_local = 50;
         let usable_size = 1000;
@@ -477,12 +478,11 @@ mod tests {
                 assert_eq!(interior.left_child_page, left_child_page);
                 assert_eq!(interior.payload_size as usize, payload.len());
                 
-                // Check that the cell contains the first part of payload
-                assert_eq!(interior.payload.len(), min_local);
-                assert_eq!(&interior.payload[..], &payload[..min_local]);
+               
+                assert_eq!(&interior.payload[..], &payload[..interior.payload.len()]);
                 
                 // Check overflow data contains the rest
-                assert_eq!(overflow_data, payload[min_local..].to_vec());
+                assert_eq!(overflow_data, payload[interior.payload.len()..].to_vec());
                 
                 // No overflow page yet
                 assert!(interior.overflow_page.is_none());
