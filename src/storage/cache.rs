@@ -170,6 +170,7 @@ impl BufferPool {
         } else {
             None
         };
+       
 
         if evicted.is_none() && self.frames.len() >= self.max_pages && !self.frames.contains_key(&page_number) {
             // If we couldn't evict a page, return the requested page (rejected)
@@ -310,13 +311,13 @@ impl BufferPool {
                 if frame.is_pinned() {
                     // Push the page to the back of the LRU list
                     self.lru_list.push_back(page_number);
-                    println!("Page {} is pinned, skipping eviction", page_number);
+            
                     continue;
                 }
                 
                 // Remove the page from the buffer pool
                 if let Some(frame) = self.frames.remove(&page_number) {
-                  println!("Evicting page {}", page_number);
+                  
                     return Some((page_number, frame.page));
                 }
             }

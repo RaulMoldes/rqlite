@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::header::{Header, SQLITE_HEADER_STRING};
+use crate::header::{self, Header, SQLITE_HEADER_STRING};
 
 /// The `DiskManager` struct is responsible for managing the low-level operations of a SQLite database file.
 /// It provides methods to read and write pages, manage the database header, and allocate new pages as needed.
@@ -235,16 +235,16 @@ impl DiskManager {
         // This is important because we need to know how many pages we have already allocated.
         // We will use this to calculate the new size of the file.
         let file_size = self.file.metadata()?.len();
-        
+  
         // Calculate the current number of pages. We cannot use page_count() here, because it would cause an error at diskmanager creation.
         // We will use the file size to calculate the number of pages.
         // We add self.page_size - 1 to ensure we round up to the next page size.
-        let current_pages = (file_size + self.page_size as u64 - 1) / self.page_size as u64;
+        let current_pages = (file_size - 100) / self.page_size as u64;
         let first_new_page = current_pages as u32 + 1;
-        
+      
         // Calculate the new size of the file
         let new_size = file_size + (count as u64 * self.page_size as u64);
-        
+
         // Update the file size
         // This is important because we need to ensure that the file is large enough to accommodate the new pages.
         self.file.set_len(new_size)?;
@@ -257,7 +257,9 @@ impl DiskManager {
         
         // Update the header to reflect the new size
         let mut header = self.read_header()?;
+     
         header.database_size = first_new_page + count - 1;
+    
         self.write_header(&header)?;
         
         Ok(first_new_page)
@@ -278,7 +280,7 @@ impl DiskManager {
     /// The offset is calculated as (page_number - 1) * page_size. Therefore, page 1 starts at offset 0, page 2 starts at offset page_size, and so on.
     /// This is a common way to calculate the offset for fixed-size pages in a file.
     fn page_offset(&self, page_number: u32) -> u64 {
-        (page_number as u64 - 1) * self.page_size as u64
+        (page_number as u64 - 1) * self.page_size as u64 + 100// We add 100 bytes to account for the header and other metadata.
     }
 
     /// Obtains the number of pages in the database file.
@@ -407,14 +409,14 @@ mod tests {
         
         // Asignar 2 páginas más
         let first_new_page = disk_manager.allocate_pages(2).unwrap();
-        assert_eq!(first_new_page, 3);
+        assert_eq!(first_new_page, 2);
         
         // Verificar que ahora hay 3 páginas
         assert_eq!(disk_manager.page_count().unwrap(), 3);
         
         // Verificar que el encabezado refleja el nuevo tamaño
         let header = disk_manager.read_header().unwrap();
-        assert_eq!(header.database_size, 4);
+        assert_eq!(header.database_size, 3);
     }
 
     #[test]
