@@ -21,6 +21,7 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 use crate::header::HEADER_SIZE;
+use std::io::Cursor;
 
 /// Page Types on SQLite. There are basically two types of pages: 
 /// Table pages: A table page is a B-Tree page that stores data from a table. 
@@ -356,94 +357,6 @@ impl BTreeCell {
     }
 }
 
-impl ByteSerializable for BTreeCell {
-
-    fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        let mut buffer = vec![0u8; self.size()];
-        match self {
-            BTreeCell::TableLeaf(leaf_cell) => {
-                let mut cell_cursor = std::io::Cursor::new(&mut buffer[0..]);
-                // Write payload size as varint
-                crate::utils::encode_varint(leaf_cell.payload_size as i64, &mut cell_cursor)?;
-                
-                // Write rowid as varint
-                crate::utils::encode_varint(leaf_cell.row_id, &mut cell_cursor)?;
-                
-                // Calculate current position
-                let pos = cell_cursor.position() as usize;
-                
-                // Write payload
-                let payload_size = leaf_cell.payload.len();
-                buffer[0 + pos..0 + pos + payload_size]
-                    .copy_from_slice(&leaf_cell.payload);
-                
-                // Write overflow page if present
-                if let Some(overflow_page) = leaf_cell.overflow_page {
-                    let overflow_offset = 0 + pos + payload_size;
-                    buffer[overflow_offset..overflow_offset + 4]
-                        .copy_from_slice(&overflow_page.to_be_bytes());
-                }
-            },
-            BTreeCell::TableInterior(interior_cell) => {
-                let mut cell_cursor = std::io::Cursor::new(&mut buffer[0..]);
-                
-                // Write left child page
-                cell_cursor.write_all(&interior_cell.left_child_page.to_be_bytes())?;
-                
-                // Write key as varint
-                crate::utils::encode_varint(interior_cell.key, &mut cell_cursor)?;
-            },
-            BTreeCell::IndexLeaf(leaf_cell) => {
-                let mut cell_cursor = std::io::Cursor::new(&mut buffer[0..]);
-                
-                // Write payload size as varint
-                crate::utils::encode_varint(leaf_cell.payload_size as i64, &mut cell_cursor)?;
-                
-                // Calculate current position
-                let pos = cell_cursor.position() as usize;
-                
-                // Write payload
-                let payload_size = leaf_cell.payload.len();
-                buffer[0 + pos..0 + pos + payload_size]
-                    .copy_from_slice(&leaf_cell.payload);
-                
-                // Write overflow page if present
-                if let Some(overflow_page) = leaf_cell.overflow_page {
-                    let overflow_offset = 0 + pos + payload_size;
-                    buffer[overflow_offset..overflow_offset + 4]
-                        .copy_from_slice(&overflow_page.to_be_bytes());
-                }
-            },
-            BTreeCell::IndexInterior(interior_cell) => {
-                let mut cell_cursor = std::io::Cursor::new(&mut buffer[0..]);
-                
-                // Write left child page
-                cell_cursor.write_all(&interior_cell.left_child_page.to_be_bytes())?;
-                
-                // Write payload size as varint
-                crate::utils::encode_varint(interior_cell.payload_size as i64, &mut cell_cursor)?;
-                
-                // Calculate current position
-                let pos = cell_cursor.position() as usize;
-                
-                // Write payload
-                let payload_size = interior_cell.payload.len();
-                buffer[0 + pos..0 + pos + payload_size]
-                    .copy_from_slice(&interior_cell.payload);
-                
-                // Write overflow page if present
-                if let Some(overflow_page) = interior_cell.overflow_page {
-                    let overflow_offset = 0 + pos + payload_size;
-                    buffer[overflow_offset..overflow_offset + 4]
-                        .copy_from_slice(&overflow_page.to_be_bytes());
-                }
-            },
-    }
-    Ok(())
-
-}
-
-}
 /// Represents a B-Tree page.
 #[derive(Debug, Clone)]
 pub struct BTreePage {
@@ -609,7 +522,356 @@ impl BTreePage {
     }
 }
 
+// Updated implementation for BTreePage
+impl ByteSerializable for BTreePage {
+    fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
+        // Read the header
+        let header = BTreePageHeader::read_from(reader)?;
+        
+        // Create a new BTreePage with default values
+        let mut page = BTreePage {
+            header: header.clone(),
+            cell_indices: Vec::new(),
+            cells: Vec::new(),
+            page_size: 0, // Will be set later
+            page_number: 0, // Will be set later
+            reserved_space: 0, // Will be set later
+        };
+        
+        // Read cell indices
+        let cell_count = header.cell_count as usize;
+        let mut cell_indices = Vec::with_capacity(cell_count);
+        
+        for _ in 0..cell_count {
+            let mut buffer = [0u8; 2];
+            reader.read_exact(&mut buffer)?;
+            let index = u16::from_be_bytes(buffer);
+            cell_indices.push(index);
+        }
+        
+        page.cell_indices = cell_indices;
+        
+        // Read the entire remaining data to have access to all cells
+        let mut remaining_data = Vec::new();
+        reader.read_to_end(&mut remaining_data)?;
+        
+        // Deserialize each cell using its offset
+        let header_size = page.header.size();
+        let indices_size = page.cell_indices.len() * 2; // 2 bytes per index
+        let content_start = header_size + indices_size;
+        
+        for &cell_index in &page.cell_indices {
+            // Calculate the actual offset in the remaining_data
+            let cell_offset = cell_index as usize - content_start;
+            
+            if cell_offset >= remaining_data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Cell offset out of range: {}", cell_offset),
+                ));
+            }
+            
+            // Create a cursor at the cell position
+            let mut cell_cursor = Cursor::new(&remaining_data[cell_offset..]);
+            
+            // Deserialize the cell based on the page type
+            let cell = match header.page_type {
+                PageType::TableLeaf => {
+                    // Read payload size
+                    let (payload_size, payload_size_bytes) = crate::utils::decode_varint(&mut cell_cursor)?;
+                    
+                    // Read rowid
+                    let (row_id, rowid_bytes) = crate::utils::decode_varint(&mut cell_cursor)?;
+                    
+                    // Calculate the position after reading varints
+                    let header_bytes = payload_size_bytes + rowid_bytes;
+                    
+                    // Read the payload
+                    let payload_size = payload_size as usize;
+                    let available_bytes = remaining_data.len() - cell_offset - header_bytes;
+                    let local_size = payload_size.min(available_bytes);
+                    
+                    let mut payload = vec![0u8; local_size];
+                    let payload_start = cell_cursor.position() as usize;
+                    payload.copy_from_slice(&remaining_data[cell_offset + payload_start..][..local_size]);
+                    
+                    // Check if there's an overflow page (if payload doesn't fit)
+                    let overflow_page = if local_size < payload_size {
+                        let overflow_offset = cell_offset + header_bytes + local_size;
+                        if overflow_offset + 4 <= remaining_data.len() {
+                            Some(u32::from_be_bytes([
+                                remaining_data[overflow_offset],
+                                remaining_data[overflow_offset + 1],
+                                remaining_data[overflow_offset + 2],
+                                remaining_data[overflow_offset + 3],
+                            ]))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    
+                    BTreeCell::TableLeaf(TableLeafCell {
+                        payload_size: payload_size as u64,
+                        row_id,
+                        payload,
+                        overflow_page,
+                    })
+                },
+                PageType::TableInterior => {
+                    if cell_offset + 4 > remaining_data.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Buffer too small to read interior cell",
+                        ));
+                    }
+                    
+                    // Read left child page
+                    let left_child_page = u32::from_be_bytes([
+                        remaining_data[cell_offset],
+                        remaining_data[cell_offset + 1],
+                        remaining_data[cell_offset + 2],
+                        remaining_data[cell_offset + 3],
+                    ]);
+                    
+                    // Read key
+                    let mut key_cursor = Cursor::new(&remaining_data[cell_offset + 4..]);
+                    let (key, _) = crate::utils::decode_varint(&mut key_cursor)?;
+                    
+                    BTreeCell::TableInterior(TableInteriorCell {
+                        left_child_page,
+                        key,
+                    })
+                },
+                PageType::IndexLeaf => {
+                    // Read payload size
+                    let (payload_size, payload_size_bytes) = crate::utils::decode_varint(&mut cell_cursor)?;
+                    
+                    // Calculate header bytes
+                    let header_bytes = payload_size_bytes;
+                    
+                    // Read the payload
+                    let payload_size = payload_size as usize;
+                    let available_bytes = remaining_data.len() - cell_offset - header_bytes;
+                    let local_size = payload_size.min(available_bytes);
+                    
+                    let mut payload = vec![0u8; local_size];
+                    let payload_start = cell_cursor.position() as usize;
+                    payload.copy_from_slice(&remaining_data[cell_offset + payload_start..][..local_size]);
+                    
+                    // Check if there's an overflow page
+                    let overflow_page = if local_size < payload_size {
+                        let overflow_offset = cell_offset + header_bytes + local_size;
+                        if overflow_offset + 4 <= remaining_data.len() {
+                            Some(u32::from_be_bytes([
+                                remaining_data[overflow_offset],
+                                remaining_data[overflow_offset + 1],
+                                remaining_data[overflow_offset + 2],
+                                remaining_data[overflow_offset + 3],
+                            ]))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    
+                    BTreeCell::IndexLeaf(IndexLeafCell {
+                        payload_size: payload_size as u64,
+                        payload,
+                        overflow_page,
+                    })
+                },
+                PageType::IndexInterior => {
+                    if cell_offset + 4 > remaining_data.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Buffer too small to read interior cell",
+                        ));
+                    }
+                    
+                    // Read left child page
+                    let left_child_page = u32::from_be_bytes([
+                        remaining_data[cell_offset],
+                        remaining_data[cell_offset + 1],
+                        remaining_data[cell_offset + 2],
+                        remaining_data[cell_offset + 3],
+                    ]);
+                    
+                    // Read payload size
+                    let mut payload_cursor = Cursor::new(&remaining_data[cell_offset + 4..]);
+                    let (payload_size, payload_size_bytes) = crate::utils::decode_varint(&mut payload_cursor)?;
+                    
+                    // Calculate header bytes
+                    let header_bytes = 4 + payload_size_bytes;
+                    
+                    // Read the payload
+                    let payload_size = payload_size as usize;
+                    let available_bytes = remaining_data.len() - cell_offset - header_bytes;
+                    let local_size = payload_size.min(available_bytes);
+                    
+                    let mut payload = vec![0u8; local_size];
+                    payload.copy_from_slice(&remaining_data[cell_offset + header_bytes..][..local_size]);
+                    
+                    // Check if there's an overflow page
+                    let overflow_page = if local_size < payload_size {
+                        let overflow_offset = cell_offset + header_bytes + local_size;
+                        if overflow_offset + 4 <= remaining_data.len() {
+                            Some(u32::from_be_bytes([
+                                remaining_data[overflow_offset],
+                                remaining_data[overflow_offset + 1],
+                                remaining_data[overflow_offset + 2],
+                                remaining_data[overflow_offset + 3],
+                            ]))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    
+                    BTreeCell::IndexInterior(IndexInteriorCell {
+                        left_child_page,
+                        payload_size: payload_size as u64,
+                        payload,
+                        overflow_page,
+                    })
+                },
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Unexpected page type for B-Tree: {:?}", header.page_type),
+                    ));
+                }
+            };
+            
+            page.cells.push(cell);
+        }
+        
+        Ok(page)
+    }
 
+    fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        // Write the header
+        self.header.write_to(writer)?;
+        
+        // Write cell indices
+        for &idx in &self.cell_indices {
+            writer.write_all(&idx.to_be_bytes())?;
+        }
+        
+        // Calculate the start of the content area
+        let header_size = self.header.size();
+        let indices_size = self.cell_indices.len() * 2; // 2 bytes per index
+        let content_start = header_size + indices_size;
+        
+        // Create a buffer for the content area - we'll fill in cells at their specific offsets
+        let mut content_buffer = vec![0u8; self.page_size as usize - content_start];
+        
+        // Write each cell to its position in the content buffer
+        for (i, cell) in self.cells.iter().enumerate() {
+            if i >= self.cell_indices.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Cell index out of range",
+                ));
+            }
+            
+            let cell_index = self.cell_indices[i] as usize;
+            if cell_index < content_start || cell_index >= self.page_size as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid cell index: {}", cell_index),
+                ));
+            }
+            
+            let buffer_offset = cell_index - content_start;
+            
+            // We need to keep track of the size of the buffer.
+            let mut buffer_size = content_buffer.len();
+
+            // Create a cursor at the cell position
+            let mut cell_cursor = Cursor::new(&mut content_buffer[buffer_offset..]);
+            
+            // Write the cell - note this doesn't include the cell type as it's determined by the page type
+            match cell {
+                BTreeCell::TableLeaf(leaf_cell) => {
+                    // Write payload size
+                    crate::utils::encode_varint(leaf_cell.payload_size as i64, &mut cell_cursor)?;
+                    buffer_size -= crate::utils::varint_size(leaf_cell.payload_size as i64);
+                    // Write rowid
+                    crate::utils::encode_varint(leaf_cell.row_id, &mut cell_cursor)?;
+                    buffer_size -= crate::utils::varint_size(leaf_cell.row_id);
+                    // Write payload
+                    let current_pos = cell_cursor.position() as usize;
+                    let available_space = buffer_size - buffer_offset - current_pos;
+                    let payload_size = leaf_cell.payload.len().min(available_space);
+                    
+                    if payload_size > 0 {
+                        cell_cursor.write_all(&leaf_cell.payload[..payload_size])?;
+                    }
+                    
+                    // Write overflow page if present
+                    if let Some(overflow_page) = leaf_cell.overflow_page {
+                        cell_cursor.write_all(&overflow_page.to_be_bytes())?;
+                    }
+                },
+                BTreeCell::TableInterior(interior_cell) => {
+                    // Write left child page
+                    cell_cursor.write_all(&interior_cell.left_child_page.to_be_bytes())?;
+                    
+                    // Write key
+                    crate::utils::encode_varint(interior_cell.key, &mut cell_cursor)?;
+                },
+                BTreeCell::IndexLeaf(leaf_cell) => {
+                    // Write payload size
+                    crate::utils::encode_varint(leaf_cell.payload_size as i64, &mut cell_cursor)?;
+                    buffer_size -= crate::utils::varint_size(leaf_cell.payload_size as i64);
+                    // Write payload
+                    let current_pos = cell_cursor.position() as usize;
+                    let available_space = buffer_size - buffer_offset - current_pos;
+                    let payload_size = leaf_cell.payload.len().min(available_space);
+                    
+                    if payload_size > 0 {
+                        cell_cursor.write_all(&leaf_cell.payload[..payload_size])?;
+                    }
+                    
+                    // Write overflow page if present
+                    if let Some(overflow_page) = leaf_cell.overflow_page {
+                        cell_cursor.write_all(&overflow_page.to_be_bytes())?;
+                    }
+                },
+                BTreeCell::IndexInterior(interior_cell) => {
+                    // Write left child page
+                    cell_cursor.write_all(&interior_cell.left_child_page.to_be_bytes())?;
+                    buffer_size -= 4;
+                    // Write payload size
+                    crate::utils::encode_varint(interior_cell.payload_size as i64, &mut cell_cursor)?;
+                    buffer_size -= crate::utils::varint_size(interior_cell.payload_size as i64);
+                    // Write payload
+                    let current_pos = cell_cursor.position() as usize;
+                    let available_space = buffer_size- buffer_offset - current_pos;
+                    let payload_size = interior_cell.payload.len().min(available_space);
+                    
+                    if payload_size > 0 {
+                        cell_cursor.write_all(&interior_cell.payload[..payload_size])?;
+                    }
+                    
+                    // Write overflow page if present
+                    if let Some(overflow_page) = interior_cell.overflow_page {
+                        cell_cursor.write_all(&overflow_page.to_be_bytes())?;
+                    }
+                },
+            }
+        }
+        
+        // Write the content buffer
+        writer.write_all(&content_buffer)?;
+        
+        Ok(())
+    }
+}
 
 
 
@@ -667,6 +929,40 @@ impl OverflowPage {
     }
 }
 
+// Implementation for OverflowPage
+impl ByteSerializable for OverflowPage {
+    fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
+        // Read next page pointer
+        let mut buffer = [0u8; 4];
+        reader.read_exact(&mut buffer)?;
+        let next_page = u32::from_be_bytes(buffer);
+        
+        // Read data
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data)?;
+        
+        // Create overflow page
+        // Note: page_size and page_number need to be set by the caller
+        Ok(OverflowPage {
+            next_page,
+            data,
+            page_size: 0,
+            page_number: 0,
+        })
+    }
+
+    fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        // Write next page pointer
+        writer.write_all(&self.next_page.to_be_bytes())?;
+        
+        // Write data
+        writer.write_all(&self.data)?;
+        
+        Ok(())
+    }
+}
+
+
 /// Represents a free page in the database.
 #[derive(Debug, Clone)]
 pub struct FreePage {
@@ -700,6 +996,32 @@ impl FreePage {
     }
 }
 
+// Implementation for FreePage
+impl ByteSerializable for FreePage {
+    fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
+        // Read next page pointer
+        let mut buffer = [0u8; 4];
+        reader.read_exact(&mut buffer)?;
+        let next_page = u32::from_be_bytes(buffer);
+        
+        // Create free page
+        // Note: page_size and page_number need to be set by the caller
+        Ok(FreePage {
+            next_page,
+            page_size: 0,
+            page_number: 0,
+        })
+    }
+
+    fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        // Write next page pointer
+        writer.write_all(&self.next_page.to_be_bytes())?;
+        
+        Ok(())
+    }
+}
+
+
 /// Represents a generic page in the database of any type.
 #[derive(Debug, Clone)]
 pub enum Page {
@@ -730,6 +1052,52 @@ impl Page {
         }
     }
 }
+
+
+// Implementation for Page enum
+impl ByteSerializable for Page {
+    fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
+        // Read the first byte to determine the page type
+        let mut buffer = [0u8; 1];
+        reader.read_exact(&mut buffer)?;
+        
+        match buffer[0] {
+            // B-Tree page types
+            0x02 | 0x05 | 0x0A | 0x0D => {
+                // Put back the first byte
+                let mut combined_reader = std::io::Cursor::new(buffer.to_vec())
+                    .chain(reader);
+                    
+                // Parse as B-Tree page
+                let btree_page = BTreePage::read_from(&mut combined_reader)?;
+                Ok(Page::BTree(btree_page))
+            },
+            // Overflow page
+            0x10 => {
+                let overflow_page = OverflowPage::read_from(reader)?;
+                Ok(Page::Overflow(overflow_page))
+            },
+            // Free page
+            0x00 => {
+                let free_page = FreePage::read_from(reader)?;
+                Ok(Page::Free(free_page))
+            },
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid page type: {}", buffer[0]),
+            )),
+        }
+    }
+
+    fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        match self {
+            Page::BTree(btree_page) => btree_page.write_to(writer),
+            Page::Overflow(overflow_page) => overflow_page.write_to(writer),
+            Page::Free(free_page) => free_page.write_to(writer),
+        }
+    }
+}
+
 
 // Implementations for converting Page to BTreePage, OverflowPage and FreePage
 impl From<Page> for BTreePage {
