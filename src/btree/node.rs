@@ -5,6 +5,8 @@
 //!
 
 use std::io;
+use std::rc::Rc;
+use std::cell::RefCell;
 
 use crate::page::{BTreePage, PageType, Page, BTreeCell};
 use crate::storage::Pager;
@@ -19,49 +21,49 @@ pub struct BTreeNode {
     /// Type of the node (interior or leaf).
     pub node_type: PageType,
     /// Mutable reference to the pager for I/O operations.
-    /// This could be an intelligent pointer to make it thread-safe and accessible by multiple workers, but let's keep it simple for now.
-    pager: *mut Pager,
+    /// Opted to use `Rc<RefCell<Pager>>` because each node needs a mutable reference to the pager,
+    /// However, there is going to be only one pager in the whole B-Tree, and there will be only one writer at a time.
+    /// This allows us to share the pager across multiple nodes while still allowing for mutable access.
+    /// If we wanted to have multiple writers, we would need to use a more complex synchronization mechanism, maybe using `Mutex` or `RwLock`.
+    pager: Rc<RefCell<Pager>>, // Decided to switch to Rc<RefCell<Pager>> for thread safety and mutability
 }
 
-// It is safe to send and sync this struct across threads as long as the raw pointer to the pager is valid.
-unsafe impl Send for BTreeNode {}
-unsafe impl Sync for BTreeNode {}
+
 
 impl BTreeNode {
     /// Creates a new B-Tree node.
     ///
-    /// # Parámetros
-    /// * `page_number` - Número de página donde se almacena el nodo.
-    /// * `node_type` - Tipo de nodo.
-    /// * `pager` - Referencia al pager para operaciones de I/O.
+    /// # Parameters
+    /// * `page_number` - Number of the page where the node is stored.
+    /// * `node_type` - Type of node.
+    /// * `pager` - Reference to the pager for I/O operations.
     ///
-    /// # Seguridad
-    /// El pager debe ser válido durante toda la vida del nodo.
-    pub fn new(page_number: u32, node_type: PageType, pager: *mut Pager) -> Self {
+    /// # Before, I was going to use a raw pointer for the pager, so the pager needed to be alive for the whole life of the node, but now with Rc and RefCell is not needed..
+    pub fn new(page_number: u32, node_type: PageType, shared_pager: Rc<RefCell<Pager>>) -> Self {
         BTreeNode {
             page_number,
             node_type,
-            pager,
+            pager: Rc::clone(&shared_pager),
         }
     }
 
-     /// Abre un nodo B-Tree existente.
-    ///
-    /// # Parámetros
-    /// * `page_number` - Número de página donde se almacena el nodo.
-    /// * `node_type` - Tipo esperado del nodo.
-    /// * `pager` - Referencia al pager para operaciones de I/O.
-    ///
-    /// # Errores
-    /// Retorna un error si la página no existe, no se puede leer, o si el tipo no coincide.
-    ///
-    /// # Seguridad
-    /// El pager debe ser válido durante toda la vida del nodo.
-    pub fn open(page_number: u32, node_type: PageType, pager: *mut Pager) -> io::Result<Self> {
-        // Verificar que la página existe y es del tipo correcto
-        unsafe {
-            let page = (*pager).get_page(page_number, Some(node_type))?;
-            
+     /// Opens an existing B-Tree node.
+     /// 
+     /// # Parameters
+     /// * `page_number` - Number of the page where the node is stored.
+     /// * `node_type` - Type of node.
+     /// * `pager` - Reference to the pager for I/O operations.
+     /// 
+     /// # Safety
+     /// The caller must ensure that the pager is valid and that the page exists. (Now this is not needed, because we are using Rc<RefCell<Pager>>)
+    pub fn open(page_number: u32, node_type: PageType, shared_pager: Rc<RefCell<Pager>>) -> io::Result<Self> {
+        // Verify that the page exists and is of the correct type
+      
+          
+                    
+        {
+            let mut pager_ref = shared_pager.borrow_mut();
+            let page = pager_ref.get_page(page_number, Some(node_type))?;
             match page {
                 Page::BTree(btree_page) => {
                     if btree_page.header.page_type != node_type {
@@ -80,99 +82,98 @@ impl BTreeNode {
                 }
             }
         }
-        
-        // Crear un nuevo nodo B-Tree con la página existente
+
+        // Creates a new BTreeNode with the given page number and type
         Ok(BTreeNode {
             page_number,
             node_type,
-            pager,
+            pager: Rc::clone(&shared_pager),
         })
-    }
+}
    
-    /// Obtiene el número de celdas en el nodo.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas de I/O.
+    /// Obtains the number of cells in the node.
+    /// 
+    /// # Errors
+    /// Returns an error if there are I/O issues.
     pub fn cell_count(&self) -> io::Result<u16> {
-        let page = self.get_page()?;
+        let page = &self.get_page_owned()?;
         Ok(page.header.cell_count)
     }
 
-    // Obtiene la página B-Tree asociada a este nodo.
+  
+
+    /// Obtains the ownership of the B-Tree page associated with this node.
     ///
-    /// # Errores
-    /// Retorna un error si hay problemas de I/O.
-    fn get_page(&self) -> io::Result<&BTreePage> {
-        unsafe {
-            match (*self.pager).get_page(self.page_number, Some(self.node_type))? {
-                Page::BTree(btree_page) => Ok(btree_page),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "La página no es de tipo BTree",
-                )),
-            }
+    /// # Errors
+    /// Returns an error if there are I/O issues.
+    /// 
+    /// # Returns
+    /// Returns an owned B-Tree page. 
+    /// I want to improve this to be able to return references but makes it more complex.
+    fn get_page_owned(&self) -> io::Result<BTreePage> {
+        let mut pager_ref = self.pager.borrow_mut();
+        match pager_ref.get_page(self.page_number, Some(self.node_type))? {
+            Page::BTree(ref btree_page) => Ok(btree_page.clone()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "La página no es de tipo BTree",
+            )),
         }
     }
 
-    /// Obtiene la página B-Tree asociada a este nodo para modificación.
-    ///
-    /// # Errores
-    /// Retorna un error si hay problemas de I/O.
-    fn get_page_mut(&self) -> io::Result<&mut BTreePage> {
-        unsafe {
-            match (*self.pager).get_page_mut(self.page_number, Some(self.node_type))? {
-                Page::BTree(btree_page) => Ok(btree_page),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "La página no es de tipo BTree",
-                )),
-            }
+    fn get_page_as_ref(&self) -> io::Result<&BTreePage> {
+        let pager_ref = self.pager.borrow();
+        match pager_ref.get_page(self.page_number, Some(self.node_type))? {
+            Page::BTree(ref btree_page) => Ok(btree_page),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "La página no es de tipo BTree",
+            )),
         }
     }
+
     
-    // Crea un nuevo nodo B-Tree hoja.
+    // Creates a new Leaf btree node.
     ///
-    /// # Parámetros
-    /// * `node_type` - Tipo de nodo hoja (TableLeaf o IndexLeaf).
-    /// * `pager` - Referencia al pager para operaciones de I/O.
-    ///
-    /// # Errores
-    /// Retorna un error si no se puede crear la página o si el tipo no es una hoja.
-    ///
-    /// # Seguridad
-    /// El pager debe ser válido durante toda la vida del nodo.
-    pub fn create_leaf(node_type: PageType, pager: *mut Pager) -> io::Result<Self> {
+    /// # Parameters
+    /// * `node_type` - Type of node (TableLeaf or IndexLeaf).
+    /// * `pager` - Reference to the pager for I/O operations.
+    /// 
+    /// # Errors
+    /// Returns an error if the page cannot be created or if the type is not leaf.
+    pub fn create_leaf(node_type: PageType, pager:Rc<RefCell<Pager>> ) -> io::Result<Self> {
         if !node_type.is_leaf() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("El tipo de página no es una hoja: {:?}", node_type),
             ));
         }
-        
-        let page_number = unsafe {
-            (*pager).create_btree_page(node_type, None)?
+
+        // I prefer to create the node first so that I do not have to borrow the pager before cloning it.
+        // I think this is more elegant and less error-prone.
+        let mut new_node = BTreeNode {
+            page_number: 0,
+            node_type,
+            pager: Rc::clone(&pager),
         };
         
-        Ok(BTreeNode {
-            page_number,
-            node_type,
-            pager,
-        })
+        let page_number =  {
+            new_node.pager.borrow_mut().create_btree_page(node_type, None)?
+        };
+        new_node.page_number = page_number;
+        Ok(new_node)
     }
 
-    /// Crea un nuevo nodo B-Tree interior.
+    /// Creates a new interior B-Tree node.
     ///
-    /// # Parámetros
-    /// * `node_type` - Tipo de nodo interior (TableInterior o IndexInterior).
-    /// * `right_most_page` - Número de página del hijo más a la derecha.
-    /// * `pager` - Referencia al pager para operaciones de I/O.
+    /// # Parameters
+    /// * `node_type` - Type of interior node (TableInterior or IndexInterior).
+    /// * `right_most_page` - Page number of the right-most child.
+    /// * `pager` - Reference to the pager for I/O operations.
     ///
-    /// # Errores
-    /// Retorna un error si no se puede crear la página o si el tipo no es interior.
-    ///
-    /// # Seguridad
-    /// El pager debe ser válido durante toda la vida del nodo.
-    pub fn create_interior(node_type: PageType, right_most_page: u32, pager: *mut Pager) -> io::Result<Self> {
+    /// # Errors
+    /// Returns an error if the page cannot be created or if the type is not interior.
+    pub fn create_interior(node_type: PageType, pager:Rc<RefCell<Pager>> ) -> io::Result<Self> {
         if !node_type.is_interior() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -180,29 +181,31 @@ impl BTreeNode {
             ));
         }
         
-        let page_number = unsafe {
-            (*pager).create_btree_page(node_type, Some(right_most_page))?
+        let mut new_node = BTreeNode {
+            page_number: 0,
+            node_type,
+            pager: Rc::clone(&pager),
         };
         
-        Ok(BTreeNode {
-            page_number,
-            node_type,
-            pager,
-        })
+        let page_number =  {
+            new_node.pager.borrow_mut().create_btree_page(node_type, None)?
+        };
+        new_node.page_number = page_number;
+        Ok(new_node)
     }
 
-    /// Obtiene una celda del nodo.
+    /// Gets a cell from the node.
     ///
-    /// # Parámetros
-    /// * `index` - Índice de la celda (comenzando desde 0).
+    /// # Parameters
+    /// * `index` - Index of the cell (starting from 0).
     ///
-    /// # Errores
-    /// Retorna un error si el índice está fuera de rango o si hay problemas de I/O.
+    /// # Errors
+    /// Returns an error if the index is out of range or if there are I/O issues.
     ///
-    /// # Retorno
-    /// Referencia a la celda.
+    /// # Returns
+    /// Reference to the cell.
     pub fn get_cell(&self, index: u16) -> io::Result<&BTreeCell> {
-        let page = self.get_page()?;
+        let page = &self.get_page_owned()?;
         
         if index >= page.header.cell_count {
             return Err(io::Error::new(
