@@ -1,33 +1,34 @@
 //! # B-Tree Node Module
 //! 
-//! Este módulo implementa los nodos del árbol B-Tree, que son la estructura
-//! fundamental para almacenar y organizar los datos de forma eficiente.
+//! This module defines the `BTreeNode` struct and its associated methods.
+//! It provides functionality for creating, opening, and manipulating B-Tree nodes.
+//!
 
 use std::io;
 
 use crate::page::{BTreePage, PageType, Page, BTreeCell};
 use crate::storage::Pager;
 
-/// Representa un nodo de un árbol B-Tree.
+/// Represents a B-Tree node.
 ///
-/// Un nodo B-Tree puede ser interior (con enlaces a otros nodos) o 
-/// hoja (donde se almacenan los datos reales).
+/// A mode in a B-Tree can be either an interior node (which contains keys and child pointers)
+/// or a leaf node (which contains actual data). See `PageType` for more details.
 pub struct BTreeNode {
-    /// Número de página donde se almacena este nodo.
+    /// Number of the page where the node is stored.
     pub page_number: u32,
-    /// Tipo de nodo (hoja o interior, de tabla o índice).
+    /// Type of the node (interior or leaf).
     pub node_type: PageType,
-    /// Referencia al pager para operaciones de I/O.
+    /// Mutable reference to the pager for I/O operations.
+    /// This could be an intelligent pointer to make it thread-safe and accessible by multiple workers, but let's keep it simple for now.
     pager: *mut Pager,
 }
 
-// Es seguro implementar Send y Sync porque solo tenemos un puntero crudo
-// que no usamos para modificar el Pager, solo para acceder a él.
+// It is safe to send and sync this struct across threads as long as the raw pointer to the pager is valid.
 unsafe impl Send for BTreeNode {}
 unsafe impl Sync for BTreeNode {}
 
 impl BTreeNode {
-    /// Crea un nuevo nodo B-Tree.
+    /// Creates a new B-Tree node.
     ///
     /// # Parámetros
     /// * `page_number` - Número de página donde se almacena el nodo.

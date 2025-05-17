@@ -943,7 +943,11 @@ impl OverflowPage {
     }
 }
 
-// Implementation for OverflowPage
+// Implementation for OverflowPage. 
+// Note that I am using fixed length integers for the page number and size.
+// I prefer to use fixed length integers for page metadata to avoid
+// issues with endianness and to make the code more readable. It also makes it much easier to serialize the whole page, 
+// as we can just read first the fixed length data and then fill the data vector with th rest of the buffer.
 impl ByteSerializable for OverflowPage {
     fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
         // Read next page pointer
