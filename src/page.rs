@@ -444,7 +444,7 @@ impl BTreePage {
     }
 
     /// Sets the content start offset based on the page size and reserved space.
-    fn update_content_start_offset(&mut self) {
+    pub fn update_content_start_offset(&mut self) {
         self.header.content_start_offset = self.page_size as u16 - self.reserved_space as u16;
     }
 

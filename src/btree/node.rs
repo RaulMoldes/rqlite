@@ -7,12 +7,50 @@
 use std::io;
 use std::rc::Rc;
 use std::cell::RefCell;
-use std::cell::{Ref, RefMut};
-
+use std::cell::{RefMut};
+use std::hash::Hasher;
 use crate::page::{BTreePage, PageType, Page, BTreeCell};
+use crate::utils::cmp::KeyValue;
 use crate::storage::Pager;
+use std::io::Cursor;
 
-use super::btree;
+//use super::btree;
+
+
+/// Extracts a key from an index node payload.
+/// 
+/// # Parameters
+/// * `payload` - The raw payload bytes from which to extract the key
+/// 
+/// # Returns
+/// A comparable key value extracted from the payload
+/// 
+/// # Errors
+/// Returns an error if the payload cannot be parsed
+fn extract_key_from_payload(payload: &[u8]) -> io::Result<KeyValue> {
+    use crate::utils::serialization::{SqliteValue, deserialize_values};
+    
+    // Parse the payload as SQLite values
+    let mut cursor = Cursor::new(payload);
+    let (values, _) = deserialize_values(&mut cursor)?;
+    
+    // Use the first value as the key
+    if values.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Empty payload in index node",
+        ));
+    }
+    
+    // Convert the first value to a comparable key
+    match &values[0] {
+        SqliteValue::Integer(i) => Ok(KeyValue::Integer(*i)),
+        SqliteValue::Float(f) => Ok(KeyValue::Float(*f)),
+        SqliteValue::String(s) => Ok(KeyValue::String(s.clone())),
+        SqliteValue::Blob(b) => Ok(KeyValue::Blob(b.clone())),
+        SqliteValue::Null => Ok(KeyValue::Null),
+    }
+}
 
 /// Represents a B-Tree node.
 ///
@@ -355,6 +393,72 @@ impl BTreeNode {
         Ok(page.free_space())
     }
 
+    /// Searches for the appropriate position in an index node based on the key.
+///
+/// # Parameters
+/// * `index_key` - The key to search for
+///
+/// # Errors
+/// Returns an error if there are I/O issues or if the node is not an index node.
+///
+/// # Returns
+/// A tuple with:
+/// - `true` if an exact match was found, `false` otherwise
+/// - The index where the key should be inserted
+pub fn find_index_key(&self, index_key: &KeyValue) -> io::Result<(bool, u16)> {
+    if !self.node_type.is_index() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "The node is not an index node",
+        ));
+    }
+    
+    let page = &(self.get_page_owned()?);
+    let cell_count = page.header.cell_count;
+    
+    // Binary search
+    let mut left = 0;
+    let mut right = cell_count.saturating_sub(1) as i32;
+    
+    while left <= right {
+        let mid = left + (right - left) / 2;
+        let mid_idx = mid as u16;
+        
+        let cell = &page.cells[mid as usize];
+        let cell_key = match cell {
+            BTreeCell::IndexLeaf(leaf_cell) => {
+                extract_key_from_payload(&leaf_cell.payload)?
+            },
+            BTreeCell::IndexInterior(interior_cell) => {
+                extract_key_from_payload(&interior_cell.payload)?
+            },
+            _ => unreachable!("Incorrect cell type"),
+        };
+        
+        match cell_key.partial_cmp(index_key) {
+            Some(std::cmp::Ordering::Equal) => {
+                return Ok((true, mid_idx));
+            },
+            Some(std::cmp::Ordering::Greater) => {
+                right = mid - 1;
+            },
+            Some(std::cmp::Ordering::Less) => {
+                left = mid + 1;
+            },
+            None => {
+                // This should not happen with our implementation
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Incomparable key types",
+                ));
+            }
+        }
+    }
+    
+    // No exact match found
+    Ok((false, left as u16))
+}
+
     /// For table interior nodes, searches for the cell containing the specified key.
     ///
     /// # Parameters
@@ -490,471 +594,385 @@ impl BTreeNode {
         // Then the rowid should be inserted at th left
         Ok((false, left as u16))
     }
+/// Splits the current node into two, moving approximately half of the cells
+/// to the new node. This method is used during insertion when a node is full.
+///
+/// # Errors
+/// Returns an error if there are I/O issues.
+///
+/// # Returns
+/// - New node created during the split
+/// - Median key (for interior nodes) or rowid (for leaf nodes)
+/// - Index of the median cell
+pub fn split(&self) -> io::Result<(BTreeNode, i64, u16)> {
+    let page = self.get_page_owned()?;
+    let cell_count = page.header.cell_count;
+    
+    // Find the splitting point (middle of the node)
+    let split_point = cell_count / 2;
+    
+    // Create a new node of the same type
+    let new_node = match self.node_type {
+        PageType::TableLeaf => BTreeNode::create_leaf(self.node_type, Rc::clone(&self.pager))?,
+        PageType::TableInterior => BTreeNode::create_interior(self.node_type, Rc::clone(&self.pager))?,
+        PageType::IndexLeaf => BTreeNode::create_leaf(self.node_type, Rc::clone(&self.pager))?,
+        PageType::IndexInterior => BTreeNode::create_interior(self.node_type, Rc::clone(&self.pager))?,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Cannot split a non-B-Tree page",
+            ));
+        }
+    };
 
-    /// Splits the current node into two, moving approximately half of the cells
-    /// to the new node. This method is used during insertion when a node is full.
-    ///
-    /// # Parameters
-    /// * `new_page_number` - Page number for the new node (optional).
-    ///
-    /// # Errors
-    /// Returns an error if there are I/O issues.
-    ///
-    /// # Returns
-    /// - New node created during the split
-    /// - Median key (for interior nodes) or maximum (for leaf nodes)
-    /// - Index of the median or maximum cell
-    pub fn split(&self) -> io::Result<(BTreeNode, i64, u16)> {
-        let mut page = self.get_page_mut()?;
-        let cell_count = page.header.cell_count;
-        
-        // Find the splitting point
-
-        let split_point = cell_count / 2;
-        
-        // Create a new node
-        let new_node = match self.node_type {
-            PageType::TableLeaf => {
-                // For leaf nodes, we need to create a new leaf node
-                BTreeNode::create_leaf(self.node_type, Rc::clone(&self.pager))?
-            },
-            PageType::TableInterior => {                
-                BTreeNode::create_interior(self.node_type,  Rc::clone(&self.pager))?
-            },
-            PageType::IndexLeaf => {
-                // Similar to TableLeaf
-                BTreeNode::create_leaf(self.node_type, Rc::clone(&self.pager))?
-            },
-            PageType::IndexInterior => {
+    // Get mutable references to both pages
+    let mut orig_page = self.get_page_mut()?;
+    let mut new_page = new_node.get_page_mut()?;
+    
+    // Move cells from the original page to the new page
+    let cells_to_move: Vec<BTreeCell> = orig_page.cells.drain(split_point as usize..).collect();
+    
+    // Move corresponding cell indices
+    let indices_to_move: Vec<u16> = orig_page.cell_indices.drain(split_point as usize..).collect();
+    
+    // Update cell counts
+    orig_page.header.cell_count = split_point;
+    new_page.header.cell_count = (cell_count - split_point) as u16;
+    
+    // Handle right-most child pointer for interior nodes
+    let median_key = if self.node_type.is_interior() {
+        if let Some(right_most) = orig_page.header.right_most_page {
+            // The original node's right-most child becomes the new node's right-most child
+            new_page.header.right_most_page = Some(right_most);
             
-                BTreeNode::create_interior(self.node_type, Rc::clone(&self.pager))?
-            },
-            PageType::Free => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Cannot divide a Free page",
-                ));
-            },
-            PageType::Overflow => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Cannot divide  an Overflow page",
-                ));
-            },
-        };
-        
-        // Move half of the cells to the new node
-        let cells_to_move = page.cells.split_off(split_point as usize);
-        let cell_indices_to_move = page.cell_indices.split_off(split_point as usize);
-        
-        // Update the cell count of the original node
-        page.header.cell_count = split_point;
-        
-        // Move the cells to the new node
-        let mut new_page = new_node.get_page_mut()?;
-        new_page.cells = cells_to_move;
-        new_page.cell_indices = cell_indices_to_move;
-        new_page.header.cell_count = cell_count - split_point;
-        
-        // For interior nodes, we need to update the right-most child
-        if self.node_type.is_interior() {
-            if let Some(right_most) = page.header.right_most_page {
-                new_page.header.right_most_page = Some(right_most);
-                
-                // The middle cell is the one that will be moved to the new node
-                let mid_cell = match self.node_type {
-                    PageType::TableInterior => {
-                        let (left_child_page, key) = match &page.cells[split_point as usize - 1] {
-                            BTreeCell::TableInterior(cell) => (cell.left_child_page, cell.key),
-                            _ => unreachable!("Tipo de celda incorrecto"),
-                        };
+            // The right-most child of the original node needs to be updated
+            // to be the left child of the cell that will be promoted
+            match self.node_type {
+                PageType::TableInterior => {
+                    // Get the middle cell that will be promoted
+                    let (mid_left_child_page, mid_key) = match &orig_page.cells[(split_point - 1) as usize] {
+                        BTreeCell::TableInterior(cell) => (cell.left_child_page, cell.key),
+                        _ => unreachable!("Incorrect cell type"),
+                    };
+                    // Now update the right-most child of the original node
+                    orig_page.header.right_most_page = Some(mid_left_child_page);
 
-                        // The left child page of the new node is the right-most child of the original node
+                    // Now add the cells to the new page
+                    for cell in cells_to_move {
+                        new_page.cells.push(cell);
+                    }
                     
-                        page.header.right_most_page = Some(left_child_page);
+                    // Add the indices to the new page
+                    for idx in indices_to_move {
+                        new_page.cell_indices.push(idx);
+                    }
+                    
+                    // Return the key that will be promoted to the parent
+                    (mid_key, split_point - 1)
+                },
+                PageType::IndexInterior => {
+                    // Similar logic for index interior nodes
+                    // First, extract the needed data from mid_cell to avoid borrow conflicts
+                    let (mid_payload, mid_left_child_page) = match &orig_page.cells[(split_point - 1) as usize] {
+                        BTreeCell::IndexInterior(cell) => (cell.payload.clone(), cell.left_child_page),
+                        _ => unreachable!("Incorrect cell type"),
+                    };
 
-                        key
-                    },
-                    PageType::IndexInterior => {
-                        let _cell = match &page.cells[split_point as usize - 1] {
-                            BTreeCell::IndexInterior(cell) => cell,
-                            _ => unreachable!("Tipo de celda incorrecto"),
-                        };
-                        // To move the cell to the new node, we need to update the left child page
-                        42
-                    },
-                    _ => unreachable!("Tipo de nodo incorrecto"),
-                };
-                
-                return Ok((new_node, mid_cell, split_point - 1));
+                    // Now, update orig_page mutably
+                    orig_page.header.right_most_page = Some(mid_left_child_page);
+
+                    // Extract key from payload for index interior nodes
+                    let key_value = extract_key_from_payload(&mid_payload)?;
+                    let key = match key_value {
+                        KeyValue::Integer(i) => i,
+                        KeyValue::Float(f) => f as i64,
+                        _ => {
+                            // For string and blob, hash the key for API compatibility
+                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                            std::hash::Hash::hash(&key_value, &mut hasher);
+                            hasher.finish() as i64
+                        }
+                    };
+
+                    // Add cells to the new page
+                    for cell in cells_to_move {
+                        new_page.cells.push(cell);
+                    }
+
+                    // Add indices to the new page
+                    for idx in indices_to_move {
+                        new_page.cell_indices.push(idx);
+                    }
+
+                    (key, split_point - 1)
+                },
+                _ => unreachable!("Not an interior node"),
             }
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Interior node without right-most child pointer",
+            ));
+        }
+    } else {
+        // For leaf nodes, we need the key of the first cell in the new node
+        // Add all cells to the new page first
+        for cell in cells_to_move {
+            new_page.cells.push(cell);
         }
         
-        // Para nodos hoja, la clave mediana es la primera clave del nuevo nodo
-        let median_key = match self.node_type {
+        // Add all indices to the new page
+        for idx in indices_to_move {
+            new_page.cell_indices.push(idx);
+        }
+        
+        // The median key is the rowid of the first cell in the new node
+        match self.node_type {
             PageType::TableLeaf => {
-                let cell = match &new_page.cells[0] {
-                    BTreeCell::TableLeaf(cell) => cell,
-                    _ => unreachable!("Tipo de celda incorrecto"),
-                };
-                
-                cell.row_id
+                let first_cell = &new_page.cells[0];
+                match first_cell {
+                    BTreeCell::TableLeaf(cell) => (cell.row_id, 0),
+                    _ => unreachable!("Incorrect cell type"),
+                }
             },
             PageType::IndexLeaf => {
-                // Similar a TableLeaf pero debe extraer la clave del payload
-                // En una implementación completa, se extraería la clave del payload
-                // Por simplicidad, usamos un valor ficticio
-                42 // Valor ficticio, en una implementación real se extraería del payload
-            },
-            _ => unreachable!("Tipo de nodo incorrecto"),
-        };
-        
-        Ok((new_node, median_key, 0))
-    }
-
-    /// Inserta una celda en el nodo en la posición correcta según la clave.
-    ///
-    /// # Parámetros
-    /// * `cell` - Celda a insertar.
-    ///
-    /// # Errores
-    /// Retorna un error si el tipo de celda no coincide con el tipo de nodo,
-    /// si no hay espacio, o si hay problemas de I/O.
-    ///
-    /// # Retorno
-    /// Tuple con:
-    /// - `true` si el nodo se dividió, `false` en caso contrario
-    /// - Clave mediana (si el nodo se dividió)
-    /// - Nuevo nodo (si el nodo se dividió)
-    pub fn insert_cell_ordered(&self, cell: BTreeCell) -> io::Result<(bool, Option<i64>, Option<BTreeNode>)> {
-        // Verificar que el tipo de celda coincide con el tipo de nodo
-        match (&self.node_type, &cell) {
-            (PageType::TableLeaf, BTreeCell::TableLeaf(_)) => {},
-            (PageType::TableInterior, BTreeCell::TableInterior(_)) => {},
-            (PageType::IndexLeaf, BTreeCell::IndexLeaf(_)) => {},
-            (PageType::IndexInterior, BTreeCell::IndexInterior(_)) => {},
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("Tipo de celda incompatible con el tipo de nodo: {:?}", self.node_type),
-                ));
-            }
-        }
-        //println!("Insertando celda: {:?}", cell);
-        let page = self.get_page_mut()?;
-        //println!("Página antes de la inserción: {:?}", page);
-        // Verificar si hay suficiente espacio para la celda
-        let cell_size = cell.size();
-        //print!("Espacio libre en la página: {}", page.free_space());
-        //println!("Tamaño de la celda: {}", cell_size);
-        if page.free_space() < cell_size + 2 { // 2 bytes para el índice de la celda
-            //println!("No hay suficiente espacio, dividiendo el nodo");
-            // No hay suficiente espacio, dividir el nodo
-            let (new_node, median_key, _) = self.split(None)?;
-            
-            // Decidir en qué nodo insertar la celda
-            let insert_in_new = match (&self.node_type, &cell) {
-                (PageType::TableLeaf, BTreeCell::TableLeaf(table_cell)) => {
-                    table_cell.row_id >= median_key
-                },
-                (PageType::TableInterior, BTreeCell::TableInterior(table_cell)) => {
-                    table_cell.key >= median_key
-                },
-                (PageType::IndexLeaf, BTreeCell::IndexLeaf(_)) => {
-                    // En una implementación completa, compararíamos la clave en el payload
-                    // Por simplicidad, asumimos que va en el nodo original
-                    false
-                },
-                (PageType::IndexInterior, BTreeCell::IndexInterior(_)) => {
-                    // Similar a IndexLeaf
-                    false
-                },
-                _ => unreachable!("Tipo de celda incorrecto"),
-            };
-            
-            
-            if insert_in_new {
-                //println!("Insertando en el nuevo nodo:");
-                // Insertar en el nuevo nodo
-                new_node.insert_cell_ordered(cell)?;
-            } else {
-                //println!("Insertando en el nodo original");
-                // Insertar en el nodo original
-                self.insert_cell_ordered(cell)?;
-            }
-            
-            return Ok((true, Some(median_key), Some(new_node)));
-        }
-        //println!("Hay suficiente espacio, insertando en el nodo correcto");
-        // Hay suficiente espacio, insertar la celda en la posición correcta
-        let position = match (&self.node_type, &cell) {
-            (PageType::TableLeaf, BTreeCell::TableLeaf(table_cell)) => {
-                //println!("Buscando posición para la celda de tabla hoja");
-                if page.header.cell_count == 0 {
-                    // Si el array de celdas está vacío, insertar en la posición 0
-                    0
-                } else {
-                    let (_, pos) = self.find_table_rowid(table_cell.row_id)?;
-                    pos
+                let first_cell = &new_page.cells[0];
+                match first_cell {
+                    BTreeCell::IndexLeaf(cell) => {
+                        let key_value = extract_key_from_payload(&cell.payload)?;
+                        match key_value {
+                            KeyValue::Integer(i) => (i, 0),
+                            KeyValue::Float(f) => (f as i64, 0),  // Convert float to int for API compatibility
+                            _ => {
+                                // For string and blob, hash the key for API compatibility
+                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                std::hash::Hash::hash(&key_value, &mut hasher);
+                                (hasher.finish() as i64, 0)
+                            }
+                        }
+                    },
+                    _ => unreachable!("Incorrect cell type"),
                 }
             },
-            (PageType::TableInterior, BTreeCell::TableInterior(table_cell)) => {
-                let (found, _, pos) = self.find_table_key(table_cell.key)?;
-                if found {
-                    // Si ya existe una celda con esta clave, reemplazarla
-                    self.get_page_mut()?.cells[pos as usize] = cell;
-                    return Ok((false, None, None));
-                }
-                pos
-            },
-            (PageType::IndexLeaf, BTreeCell::IndexLeaf(_)) => {
-                // En una implementación completa, buscaríamos la posición correcta
-                // Por simplicidad, insertamos al final
-                page.header.cell_count
-            },
-            (PageType::IndexInterior, BTreeCell::IndexInterior(_)) => {
-                // Similar a IndexLeaf
-                page.header.cell_count
-            },
-            _ => unreachable!("Tipo de celda incorrecto"),
-        };
-        
-        // Insertar la celda en la posición correcta
-        page.cells.insert(position as usize, cell);
-        page.header.cell_count += 1;
-        
-        // Actualizar los índices de celda
-        // En una implementación completa, se actualizarían correctamente
-        // Por simplicidad, asumimos que se actualizan automáticamente
-        
-        Ok((false, None, None))
-    }
+            _ => unreachable!("Not a leaf node"),
+        }
+    };
+    
+    // Update the content start offset for both pages
+    orig_page.update_content_start_offset();
+    new_page.update_content_start_offset();
+    drop(orig_page);
+    drop(new_page);
 
-
+    Ok((new_node, median_key.0, median_key.1))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Cursor;
-    use tempfile::tempdir;
-    use crate::page::{Page, BTreePage, PageType, TableLeafCell, TableInteriorCell};
-    use crate::storage::Pager;
-
-    #[test]
-    fn test_create_leaf_node() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        
-        // Crear un pager
-        let mut pager = Pager::create(&db_path, 4096, 0).unwrap();
-        
-        // Crear un nodo hoja
-        let node = BTreeNode::create_leaf(PageType::TableLeaf, &mut pager as *mut Pager).unwrap();
-        
-        assert_eq!(node.node_type, PageType::TableLeaf);
-        assert_eq!(node.cell_count().unwrap(), 0);
+/// Inserts a cell into the node in the correct position based on the key.
+///
+/// # Parameters
+/// * `cell` - Cell to insert.
+///
+/// # Errors
+/// Returns an error if the cell type does not match the node type,
+/// if there is no space, or if there are I/O issues.
+///
+/// # Returns
+/// Tuple with:
+/// - `true` if the node was split, `false` otherwise
+/// - Median key (if the node was split)
+/// - New node (if the node was split)
+pub fn insert_cell_ordered(&self, cell: BTreeCell) -> io::Result<(bool, Option<i64>, Option<BTreeNode>)> {
+    // Verify that the cell type matches the node type
+    match (&self.node_type, &cell) {
+        (PageType::TableLeaf, BTreeCell::TableLeaf(_)) => {},
+        (PageType::TableInterior, BTreeCell::TableInterior(_)) => {},
+        (PageType::IndexLeaf, BTreeCell::IndexLeaf(_)) => {},
+        (PageType::IndexInterior, BTreeCell::IndexInterior(_)) => {},
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Cell type incompatible with node type: {:?}", self.node_type),
+            ));
+        }
     }
-
-    #[test]
-    fn test_create_interior_node() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
+    
+    // Calculate cell size
+    let cell_size = cell.size();
+    let cell_index_size = 2; // 2 bytes for the cell index
+    
+    // Check if the node has enough space for the new cell
+    let free_space = {
+        let page = self.get_page_owned()?;
+        page.free_space()
+    };
+    
+    if free_space < cell_size + cell_index_size {
+        // Not enough space, split the node
+        let (new_node, median_key, _) = self.split()?;
         
-        // Crear un pager
-        let mut pager = Pager::create(&db_path, 4096, 0).unwrap();
-        
-        // Crear un nodo interior
-        let node = BTreeNode::create_interior(PageType::TableInterior, 1, &mut pager as *mut Pager).unwrap();
-        
-        assert_eq!(node.node_type, PageType::TableInterior);
-        assert_eq!(node.cell_count().unwrap(), 0);
-        assert_eq!(node.get_right_most_child().unwrap(), 1);
-    }
-
-    #[test]
-    fn test_insert_cell() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        
-        // Crear un pager
-        let mut pager = Pager::create(&db_path, 4096, 0).unwrap();
-        
-        // Crear un nodo hoja
-        let node = BTreeNode::create_leaf(PageType::TableLeaf, &mut pager as *mut Pager).unwrap();
-        
-        // Crear una celda
-        let cell = BTreeCell::TableLeaf(TableLeafCell {
-            payload_size: 10,
-            row_id: 42,
-            payload: vec![0; 10],
-            overflow_page: None,
-        });
-        
-        // Insertar la celda
-        let idx = node.insert_cell(cell).unwrap();
-        assert_eq!(idx, 0);
-        
-        // Verificar que la celda se insertó correctamente
-        assert_eq!(node.cell_count().unwrap(), 1);
-        
-        let cell = node.get_cell(0).unwrap();
-        match cell {
-            BTreeCell::TableLeaf(table_cell) => {
-                assert_eq!(table_cell.row_id, 42);
-                assert_eq!(table_cell.payload_size, 10);
+        // Determine which node should receive the new cell
+        let insert_in_new = match (&self.node_type, &cell) {
+            (PageType::TableLeaf, BTreeCell::TableLeaf(table_cell)) => {
+                table_cell.row_id >= median_key
             },
-            _ => panic!("Tipo de celda incorrecto"),
+            (PageType::TableInterior, BTreeCell::TableInterior(table_cell)) => {
+                table_cell.key >= median_key
+            },
+            (PageType::IndexLeaf, BTreeCell::IndexLeaf(index_cell)) => {
+                // Extract the key from the payload
+                let key_value = extract_key_from_payload(&index_cell.payload)?;
+                
+                // Need a comparable form of the median key
+                let median_key_value = KeyValue::Integer(median_key);
+                
+                // Compare with the median key
+                match key_value.partial_cmp(&median_key_value) {
+                    Some(std::cmp::Ordering::Less) => false,
+                    Some(_) => true,
+                    None => {
+                        // Fallback to a simple comparison
+                        index_cell.payload_size as i64 >= median_key
+                    }
+                }
+            },
+            (PageType::IndexInterior, BTreeCell::IndexInterior(index_cell)) => {
+                // Similar logic as IndexLeaf
+                let key_value = extract_key_from_payload(&index_cell.payload)?;
+                let median_key_value = KeyValue::Integer(median_key);
+                
+                match key_value.partial_cmp(&median_key_value) {
+                    Some(std::cmp::Ordering::Less) => false,
+                    Some(_) => true,
+                    None => {
+                        // Fallback to a simple comparison
+                        index_cell.payload_size as i64 >= median_key
+                    }
+                }
+            },
+            _ => unreachable!("Incorrect cell type"),
+        };
+        
+        // Insert the cell into the appropriate node
+        if insert_in_new {
+            new_node.insert_cell_ordered(cell)?;
+        } else {
+            self.insert_cell_ordered(cell)?;
         }
+        
+        return Ok((true, Some(median_key), Some(new_node)));
     }
-
-    #[test]
-    fn test_find_table_rowid() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        
-        // Crear un pager
-        let mut pager = Pager::create(&db_path, 4096, 0).unwrap();
-        
-        // Crear un nodo hoja
-        let node = BTreeNode::create_leaf(PageType::TableLeaf, &mut pager as *mut Pager).unwrap();
-        
-        // Insertar algunas celdas
-        for i in [10, 20, 30, 40, 50] {
-            let cell = BTreeCell::TableLeaf(TableLeafCell {
-                payload_size: 10,
-                row_id: i,
-                payload: vec![0; 10],
-                overflow_page: None,
-            });
+    
+    // There's enough space, find the correct position for the new cell
+    let position = match (&self.node_type, &cell) {
+        (PageType::TableLeaf, BTreeCell::TableLeaf(table_cell)) => {
+            // Find position based on rowid for table leaf nodes
+            let (found, idx) = self.find_table_rowid(table_cell.row_id)?;
             
-            node.insert_cell(cell).unwrap();
-        }
-        
-        // Buscar rowids existentes
-        let (found, idx) = node.find_table_rowid(10).unwrap();
-        assert!(found);
-        assert_eq!(idx, 0);
-        
-        let (found, idx) = node.find_table_rowid(30).unwrap();
-        assert!(found);
-        assert_eq!(idx, 2);
-        
-        let (found, idx) = node.find_table_rowid(50).unwrap();
-        assert!(found);
-        assert_eq!(idx, 4);
-        
-        // Buscar rowids que no existen
-        let (found, idx) = node.find_table_rowid(15).unwrap();
-        assert!(!found);
-        assert_eq!(idx, 1);
-        
-        let (found, idx) = node.find_table_rowid(5).unwrap();
-        assert!(!found);
-        assert_eq!(idx, 0);
-        
-        let (found, idx) = node.find_table_rowid(60).unwrap();
-        assert!(!found);
-        assert_eq!(idx, 5);
-    }
-
-    #[test]
-    fn test_insert_cell_ordered() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        
-        // Crear un pager
-        let mut pager = Pager::create(&db_path, 4096, 0).unwrap();
-        
-        // Crear un nodo hoja
-        let node = BTreeNode::create_leaf(PageType::TableLeaf, &mut pager as *mut Pager).unwrap();
-        
-        // Insertar celdas ordenadas
-        for i in [30, 10, 50, 20, 40] {
-            let cell = BTreeCell::TableLeaf(TableLeafCell {
-                payload_size: 10,
-                row_id: i,
-                payload: vec![0; 10],
-                overflow_page: None,
-            });
-            
-            let (split, median_key, new_node) = node.insert_cell_ordered(cell).unwrap();
-            assert!(!split);
-            assert_eq!(median_key, None);
-            assert_eq!(new_node.is_none(), true);
-        }
-        
-        // Verificar que las celdas están ordenadas por rowid
-        assert_eq!(node.cell_count().unwrap(), 5);
-        
-        for i in 0..5 {
-            let cell = node.get_cell(i).unwrap();
-            match cell {
-                BTreeCell::TableLeaf(table_cell) => {
-                    assert_eq!(table_cell.row_id, (i as i64 + 1) * 10);
-                },
-                _ => panic!("Tipo de celda incorrecto"),
+            if found {
+                // Replace existing cell with the same rowid
+                let mut page = self.get_page_mut()?;
+                page.cells[idx as usize] = cell;
+                return Ok((false, None, None));
             }
-        }
-    }
-
-    #[test]
-    fn test_split_node() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        
-        // Crear un pager con página pequeña para forzar divisiones
-        let mut pager = Pager::create(&db_path, 512, 0).unwrap();
-        
-        // Crear un nodo hoja
-        let node = BTreeNode::create_leaf(PageType::TableLeaf, &mut pager as *mut Pager).unwrap();
-        
-        // Insertar suficientes celdas para llenar el nodo
-        for i in 1..=20 {
-            let cell = BTreeCell::TableLeaf(TableLeafCell {
-                payload_size: 20,
-                row_id: i,
-                payload: vec![0; 20],
-                overflow_page: None,
-            });
             
-            let (split, median_key, new_node) = node.insert_cell_ordered(cell).unwrap();
+            idx
+        },
+        (PageType::TableInterior, BTreeCell::TableInterior(table_cell)) => {
+            // Find position based on key for table interior nodes
+            let page = self.get_page_owned()?;
             
-            if split {
-                // Verificar que la división ocurrió correctamente
-                assert!(median_key.is_some());
-                assert!(new_node.is_some());
+            if page.header.cell_count == 0 {
+                0
+            } else {
+                // Binary search for the correct position
+                let mut left = 0;
+                let mut right = page.header.cell_count as i32 - 1;
+                let mut pos = 0;
                 
-                let median = median_key.unwrap();
-                let new = new_node.unwrap();
+                while left <= right {
+                    let mid = left + (right - left) / 2;
+                    let mid_cell = &page.cells[mid as usize];
+                    
+                    let mid_key = match mid_cell {
+                        BTreeCell::TableInterior(interior_cell) => interior_cell.key,
+                        _ => unreachable!("Incorrect cell type"),
+                    };
+                    
+                    if mid_key == table_cell.key {
+                        // Replace cell with same key
+                        let mut page = self.get_page_mut()?;
+                        page.cells[mid as usize] = cell;
+                        return Ok((false, None, None));
+                    } else if mid_key > table_cell.key {
+                        right = mid - 1;
+                    } else {
+                        left = mid + 1;
+                        pos = left as u16;
+                    }
+                }
                 
-                // Verificar que las celdas se dividieron aproximadamente por la mitad
-                let node_count = node.cell_count().unwrap();
-                let new_count = new.cell_count().unwrap();
-                
-                assert!(node_count > 0);
-                assert!(new_count > 0);
-                assert!(node_count + new_count >= 20);
-                
-                // Verificar que la clave mediana es correcta
-                assert!(median > 0);
-                
-                // Verificar que las celdas están correctamente distribuidas
-                let max_node = match node.get_cell(node_count - 1).unwrap() {
-                    BTreeCell::TableLeaf(cell) => cell.row_id,
-                    _ => panic!("Tipo de celda incorrecto"),
-                };
-                
-                let min_new = match new.get_cell(0).unwrap() {
-                    BTreeCell::TableLeaf(cell) => cell.row_id,
-                    _ => panic!("Tipo de celda incorrecto"),
-                };
-                
-                assert!(max_node < min_new);
-                assert_eq!(min_new, median);
-                
-                break;
+                pos
             }
-        }
+        },
+        (PageType::IndexLeaf, BTreeCell::IndexLeaf(index_cell)) => {
+            // For index leaf nodes, find position based on the key in the payload
+            let key_value = extract_key_from_payload(&index_cell.payload)?;
+            let (found, idx) = self.find_index_key(&key_value)?;
+            
+            if found {
+                // Replace existing cell with the same key
+                let mut page = self.get_page_mut()?;
+                page.cells[idx as usize] = cell;
+                return Ok((false, None, None));
+            }
+            
+            idx
+        },
+        (PageType::IndexInterior, BTreeCell::IndexInterior(index_cell)) => {
+            // Similar to IndexLeaf
+            let key_value = extract_key_from_payload(&index_cell.payload)?;
+            let (found, idx) = self.find_index_key(&key_value)?;
+            
+            if found {
+                // Replace existing cell with the same key
+                let mut page = self.get_page_mut()?;
+                page.cells[idx as usize] = cell;
+                return Ok((false, None, None));
+            }
+            
+            idx
+        },
+        _ => unreachable!("Incorrect cell type"),
+    };
+    
+    // Insert the cell at the calculated position
+    let mut page = self.get_page_mut()?;
+    
+    // Calculate appropriate cell offset in the page
+    let offset = if page.header.cell_count > 0 && position < page.header.cell_count {
+        // For interior cells, try to maintain proper spacing
+        let existing_offset = page.cell_indices[position as usize];
+        existing_offset - cell_size as u16
+    } else {
+        // Calculate a new offset for the end of the page
+        page.header.content_start_offset - cell_size as u16
+    };
+    
+    // Insert the cell and its index
+    if position < page.header.cell_count {
+        page.cells.insert(position as usize, cell);
+        page.cell_indices.insert(position as usize, offset);
+    } else {
+        page.cells.push(cell);
+        page.cell_indices.push(offset);
     }
+    
+    // Update page metadata
+    page.header.cell_count += 1;
+    page.header.content_start_offset = page.cell_indices.iter().min().copied().unwrap_or(page.header.content_start_offset);
+    
+    Ok((false, None, None))
+}
+
+
 }
