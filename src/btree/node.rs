@@ -7,9 +7,12 @@
 use std::io;
 use std::rc::Rc;
 use std::cell::RefCell;
+use std::cell::{Ref, RefMut};
 
 use crate::page::{BTreePage, PageType, Page, BTreeCell};
 use crate::storage::Pager;
+
+use super::btree;
 
 /// Represents a B-Tree node.
 ///
@@ -109,25 +112,39 @@ impl BTreeNode {
     /// 
     /// # Returns
     /// Returns an owned B-Tree page. 
-    /// I want to improve this to be able to return references but makes it more complex.
+    /// I want to improve this to be able to return references but makes it more complex, because to get a page i need a mutable `pager` and to get a mutable pager i need to borrow it mutably, and this is not possible if i have a reference to the pager.
     fn get_page_owned(&self) -> io::Result<BTreePage> {
         let mut pager_ref = self.pager.borrow_mut();
         match pager_ref.get_page(self.page_number, Some(self.node_type))? {
             Page::BTree(ref btree_page) => Ok(btree_page.clone()),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "La página no es de tipo BTree",
+                "The page is not of BTree type",
             )),
         }
     }
 
-    fn get_page_as_ref(&self) -> io::Result<&BTreePage> {
-        let pager_ref = self.pager.borrow();
-        match pager_ref.get_page(self.page_number, Some(self.node_type))? {
-            Page::BTree(ref btree_page) => Ok(btree_page),
+   
+    
+    // Get a mutable reference to the BTreePage.
+    // This is a bit tricky because we need to ensure that the pager is not borrowed mutably
+    // while we are trying to get a mutable reference to the page. I am using RefMut to handle this.
+    /// Obtains a mutable reference to the B-Tree page associated with this node.
+    /// 
+    /// # Errors
+    /// Returns an error if there are I/O issues.
+    fn get_page_mut(&self) -> io::Result<impl std::ops::DerefMut<Target = BTreePage> + '_> {
+        let mut pager_ref = self.pager.borrow_mut();
+        match pager_ref.get_page_mut(self.page_number, Some(self.node_type))? {
+            Page::BTree(_btree_page) => Ok(RefMut::map(pager_ref, |p| {
+                match p.get_page_mut(self.page_number, Some(self.node_type)).unwrap() {
+                    Page::BTree(page) => page,
+                    _ => unreachable!(),
+                }
+            })),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "La página no es de tipo BTree",
+                "The page is not of BTree type",
             )),
         }
     }
@@ -145,7 +162,7 @@ impl BTreeNode {
         if !node_type.is_leaf() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("El tipo de página no es una hoja: {:?}", node_type),
+                format!("The BTreeNode is not of type leaf: {:?}", node_type),
             ));
         }
 
@@ -177,7 +194,7 @@ impl BTreeNode {
         if !node_type.is_interior() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("El tipo de página no es interior: {:?}", node_type),
+                format!("The BTreeNode is not of type interior: {:?}", node_type),
             ));
         }
         
@@ -203,9 +220,9 @@ impl BTreeNode {
     /// Returns an error if the index is out of range or if there are I/O issues.
     ///
     /// # Returns
-    /// Reference to the cell.
-    pub fn get_cell(&self, index: u16) -> io::Result<&BTreeCell> {
-        let page = &self.get_page_owned()?;
+    /// An owned cell.
+    pub fn get_cell_owned(&self, index: u16) -> io::Result<BTreeCell> {
+        let page = &(self.get_page_owned()?); // As soon as I get the page, I can release the pager.
         
         if index >= page.header.cell_count {
             return Err(io::Error::new(
@@ -214,39 +231,49 @@ impl BTreeNode {
             ));
         }
         
-        Ok(&page.cells[index as usize])
+        Ok(page.cells[index as usize].clone())
     }
 
-    /// Obtiene una celda del nodo para modificación.
+    /// Gets a cell from the node for modification.
     ///
-    /// # Parámetros
-    /// * `index` - Índice de la celda (comenzando desde 0).
+    /// # Parameters
+    /// * `index` - Index of the cell (starting from 0).
     ///
-    /// # Errores
-    /// Retorna un error si el índice está fuera de rango o si hay problemas de I/O.
+    /// # Errors
+    /// Returns an error if the index is out of range or if there are I/O issues.
     ///
-    /// # Retorno
-    /// Referencia mutable a la celda.
-    pub fn get_cell_mut(&self, index: u16) -> io::Result<&mut BTreeCell> {
-        let page = self.get_page_mut()?;
-        
-        if index >= page.header.cell_count {
+    /// # Returns
+    /// Mutable reference to the cell.
+    pub fn get_cell_mut(&self, index: u16) -> io::Result<impl std::ops::DerefMut<Target = BTreeCell> + '_> {
+        let pager_ref = self.pager.borrow_mut();
+        let page_ref = RefMut::map(pager_ref, |pager| {
+            match pager.get_page_mut(self.page_number, Some(self.node_type)).unwrap() {
+                Page::BTree(page) => page,
+                _ => unreachable!(),
+            }
+        });
+
+        if index >= page_ref.header.cell_count {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Índice de celda fuera de rango: {}, máximo {}", index, page.header.cell_count - 1),
+                format!("Index of cell is out of range: {}, maximum {}", index, page_ref.header.cell_count - 1),
             ));
         }
-        
-        Ok(&mut page.cells[index as usize])
+
+        Ok(RefMut::map(page_ref, move |page| &mut page.cells[index as usize]))
     }
 
-    /// Inserta una celda en el nodo.
-    ///
-    /// # Parámetros
-    /// * `cell` - Celda a insertar.
-    ///
-    /// # Errores
-    /// Retorna un error si el tipo de celda no coincide con el tipo de nodo o si no hay espacio.
+    /// Inserts a cell into the node.
+    /// 
+    /// # Parameters
+    /// * `cell` - Cell to insert.
+    /// 
+    /// # Errors
+    /// Returns an error if the cell type does not match the node type,
+    /// if there is no space, or if there are I/O issues.
+    /// 
+    /// # Returns
+    /// The index of the newly inserted cell.
     pub fn insert_cell(&self, cell: BTreeCell) -> io::Result<u16> {
         // Verificar que el tipo de celda coincide con el tipo de nodo
         match (&self.node_type, &cell) {
@@ -257,12 +284,12 @@ impl BTreeNode {
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("Tipo de celda incompatible con el tipo de nodo: {:?}", self.node_type),
+                    format!("Type of cell is not compatible with the type of node: {:?}", self.node_type),
                 ));
             }
         }
         
-        let page = self.get_page_mut()?;
+        let mut page = self.get_page_mut()?;
         
         // Añadir la celda a la página
         page.add_cell(cell)?;
@@ -271,85 +298,88 @@ impl BTreeNode {
         Ok(page.header.cell_count - 1)
     }
 
-    /// Obtiene el número de página del hijo más a la derecha (solo para nodos interiores).
-    ///
-    /// # Errores
-    /// Retorna un error si el nodo no es interior o si hay problemas de I/O.
+    /// Obtains the right-most child of the node (only for interior nodes).
+    /// 
+    /// # Errors
+    /// Returns an error if the node is not an interior node or if there are I/O issues.
+    /// 
+    /// # Returns
+    /// The page number of the right-most child.
     pub fn get_right_most_child(&self) -> io::Result<u32> {
         if !self.node_type.is_interior() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "El nodo no es interior",
+                "The node is not interior type.",
             ));
         }
         
-        let page = self.get_page()?;
+        let page = &(self.get_page_owned()?);
         
         match page.header.right_most_page {
             Some(page_number) => Ok(page_number),
             None => Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "No hay hijo más a la derecha",
+                "Right-most child not found",
             )),
         }
     }
 
-    /// Establece el número de página del hijo más a la derecha (solo para nodos interiores).
-    ///
-    /// # Parámetros
-    /// * `page_number` - Número de página del hijo más a la derecha.
-    ///
-    /// # Errores
-    /// Retorna un error si el nodo no es interior o si hay problemas de I/O.
+    /// Stablishes the right-most child of the node (only for interior nodes).
+    /// 
+    /// # Parameters
+    /// * `page_number` - Page number of the right-most child.
+    /// 
+    /// # Errors
+    /// Returns an error if the node is not an interior node or if there are I/O issues.
     pub fn set_right_most_child(&self, page_number: u32) -> io::Result<()> {
         if !self.node_type.is_interior() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "El nodo no es interior",
+                "The node is not interior type.",
             ));
         }
         
-        let page = self.get_page_mut()?;
+        let mut page = self.get_page_mut()?;
         
         page.header.right_most_page = Some(page_number);
         
         Ok(())
     }
 
-    /// Obtiene el espacio libre en el nodo.
+    /// Gets the free space in the node.
     ///
-    /// # Errores
-    /// Retorna un error si hay problemas de I/O.
+    /// # Errors
+    /// Returns an error if there are I/O issues.
     pub fn free_space(&self) -> io::Result<usize> {
-        let page = self.get_page()?;
+        let page = &(self.get_page_owned()?);
         Ok(page.free_space())
     }
 
-    /// Para nodos interiores de tabla, busca la celda que contiene la clave especificada.
+    /// For table interior nodes, searches for the cell containing the specified key.
     ///
-    /// # Parámetros
-    /// * `key` - Clave a buscar (rowid).
+    /// # Parameters
+    /// * `key` - Key to search for (rowid).
     ///
-    /// # Errores
-    /// Retorna un error si el nodo no es interior de tabla o si hay problemas de I/O.
+    /// # Errors
+    /// Returns an error if the node is not a table interior node or if there are I/O issues.
     ///
-    /// # Retorno
-    /// Tuple con:
-    /// - `true` si se encontró una celda con la clave exacta, `false` en caso contrario
-    /// - Número de página del hijo que puede contener la clave
-    /// - Índice de la celda que contiene la clave o donde debería insertarse
+    /// # Returns
+    /// Tuple with:
+    /// - `true` if a cell with the exact key was found, `false` otherwise
+    /// - Page number of the child that may contain the key
+    /// - Index of the cell containing the key or where it should be inserted
     pub fn find_table_key(&self, key: i64) -> io::Result<(bool, u32, u16)> {
         if self.node_type != PageType::TableInterior {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "El nodo no es interior de tabla",
+                "The node is not a table interior",
             ));
         }
         
-        let page = self.get_page()?;
+        let page = &(self.get_page_owned()?); // As always I get the page and release the pager
         let cell_count = page.header.cell_count;
         
-        // Búsqueda binaria
+        // Binary search
         let mut left = 0;
         let mut right = cell_count.saturating_sub(1) as i32;
         
@@ -360,214 +390,198 @@ impl BTreeNode {
             let cell = &page.cells[mid as usize];
             let mid_key = match cell {
                 BTreeCell::TableInterior(cell) => cell.key,
-                _ => unreachable!("Tipo de celda incorrecto"),
+                _ => unreachable!("Incorrect cell type"),
             };
             
             if mid_key == key {
-                // Encontramos una coincidencia exacta
+                // Found an exact match
                 let left_child = match cell {
                     BTreeCell::TableInterior(cell) => cell.left_child_page,
-                    _ => unreachable!("Tipo de celda incorrecto"),
+                    _ => unreachable!("Incorrect cell type"),
                 };
                 
                 return Ok((true, left_child, mid_idx));
             } else if mid_key > key {
-                // La clave está a la izquierda
+                // The key is to the left
                 right = mid - 1;
             } else {
-                // La clave está a la derecha
+                // The key is to the right
                 left = mid + 1;
             }
         }
         
-        // No encontramos una coincidencia exacta
+        // No exact match found
         
         if cell_count == 0 || right < 0 {
-            // La clave es menor que todas las claves en el nodo
-            // o el nodo está vacío, por lo que la clave debería estar
-            // en el hijo más a la derecha
+            // The node is empty or the key is less than the smallest key
+            // Therefore if the key exists, it should be inserted at the right-most child
             match page.header.right_most_page {
                 Some(right_most_page) => Ok((false, right_most_page, 0)),
                 None => Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    "No hay hijo más a la derecha",
+                    "No right-most child found",
                 )),
             }
         } else {
-            // La clave está entre dos claves en el nodo
+            // The key is greater than the largest key
             let idx = right as u16;
             let cell = &page.cells[idx as usize];
             let left_child = match cell {
                 BTreeCell::TableInterior(cell) => cell.left_child_page,
-                _ => unreachable!("Tipo de celda incorrecto"),
+                _ => unreachable!("Incorrect cell type"),
             };
             
             Ok((false, left_child, idx))
         }
     }
 
-    /// Para nodos hoja de tabla, busca la celda con el rowid especificado.
+    /// For table leaf nodes, searches for the cell with the specified rowid.
     ///
-    /// # Parámetros
-    /// * `rowid` - Rowid a buscar.
+    /// # Parameters
+    /// * `rowid` - Rowid to search for.
     ///
-    /// # Errores
-    /// Retorna un error si el nodo no es hoja de tabla o si hay problemas de I/O.
+    /// # Errors
+    /// Returns an error if the node is not a table leaf or if there are I/O issues.
     ///
-    /// # Retorno
-    /// Tuple con:
-    /// - `true` si se encontró una celda con el rowid exacto, `false` en caso contrario
-    /// - Índice de la celda que contiene el rowid o donde debería insertarse
+    /// # Returns
+    /// Tuple with:
+    /// - `true` if a cell with the exact rowid was found, `false` otherwise
+    /// - Index of the cell containing the rowid or where it should be inserted
     pub fn find_table_rowid(&self, rowid: i64) -> io::Result<(bool, u16)> {
         if self.node_type != PageType::TableLeaf {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "El nodo no es hoja de tabla",
+                "The node is not a table leaf",
             ));
         }
         
-        let page = self.get_page()?;
+        let page = &(self.get_page_owned()?);
         let cell_count = page.header.cell_count;
         
-        // Búsqueda binaria
+        // Binary search
         let mut left = 0;
         let mut right = cell_count.saturating_sub(1) as i32;
-        //print!("Buscando rowid {} en el nodo hoja: ", rowid);
-        //println!("Número de celdas: {}", cell_count);
-        //println!("left: {}, right: {}", left, right);
+       
         while left <= right {
             let mid = left + (right - left) / 2;
-            //println!("mid: {}", mid);
+         
             let mid_idx = mid as u16;
             
             
             let cell = &page.cells[mid as usize];
             let mid_rowid = match cell {
                 BTreeCell::TableLeaf(cell) => cell.row_id,
-                _ => unreachable!("Tipo de celda incorrecto"),
+                _ => unreachable!("Incorrect cell type"),
             };
             
             if mid_rowid == rowid {
-                // Encontramos una coincidencia exacta
+                // Found an exact match
                 return Ok((true, mid_idx));
             } else if mid_rowid > rowid {
-                // El rowid está a la izquierda
+                // The row key is to the left
                 right = mid - 1;
             } else {
-                // El rowid está a la derecha
+                // The row key is to the right
                 left = mid + 1;
             }
         }
         
-        // No encontramos una coincidencia exacta
-        // La posición de inserción es left
+        // No exact match found
+        // Then the rowid should be inserted at th left
         Ok((false, left as u16))
     }
 
-    /// Divide el nodo actual en dos, moviendo aproximadamente la mitad de las celdas
-    /// al nuevo nodo. Este método se utiliza durante la inserción cuando un nodo está lleno.
+    /// Splits the current node into two, moving approximately half of the cells
+    /// to the new node. This method is used during insertion when a node is full.
     ///
-    /// # Parámetros
-    /// * `new_page_number` - Número de página para el nuevo nodo (opcional).
+    /// # Parameters
+    /// * `new_page_number` - Page number for the new node (optional).
     ///
-    /// # Errores
-    /// Retorna un error si hay problemas de I/O.
+    /// # Errors
+    /// Returns an error if there are I/O issues.
     ///
-    /// # Retorno
-    /// - Nuevo nodo creado durante la división
-    /// - Clave mediana (para nodos interiores) o máxima (para nodos hoja)
-    /// - Índice de la celda mediana o máxima
-    pub fn split(&self, new_page_number: Option<u32>) -> io::Result<(BTreeNode, i64, u16)> {
-        let page = self.get_page_mut()?;
+    /// # Returns
+    /// - New node created during the split
+    /// - Median key (for interior nodes) or maximum (for leaf nodes)
+    /// - Index of the median or maximum cell
+    pub fn split(&self) -> io::Result<(BTreeNode, i64, u16)> {
+        let mut page = self.get_page_mut()?;
         let cell_count = page.header.cell_count;
         
-        // Determinar el punto de división (aproximadamente la mitad)
+        // Find the splitting point
+
         let split_point = cell_count / 2;
         
-        // Crear un nuevo nodo
+        // Create a new node
         let new_node = match self.node_type {
             PageType::TableLeaf => {
-                // Para nodos hoja, simplemente crear un nuevo nodo hoja
-                BTreeNode::create_leaf(self.node_type, self.pager)?
+                // For leaf nodes, we need to create a new leaf node
+                BTreeNode::create_leaf(self.node_type, Rc::clone(&self.pager))?
             },
-            PageType::TableInterior => {
-                // Para nodos interiores, necesitamos un hijo más a la derecha
-                let mid_cell = match &page.cells[split_point as usize] {
-                    BTreeCell::TableInterior(cell) => cell,
-                    _ => unreachable!("Tipo de celda incorrecto"),
-                };
-                
-                BTreeNode::create_interior(self.node_type, mid_cell.left_child_page, self.pager)?
+            PageType::TableInterior => {                
+                BTreeNode::create_interior(self.node_type,  Rc::clone(&self.pager))?
             },
             PageType::IndexLeaf => {
-                // Similar a TableLeaf
-                BTreeNode::create_leaf(self.node_type, self.pager)?
+                // Similar to TableLeaf
+                BTreeNode::create_leaf(self.node_type, Rc::clone(&self.pager))?
             },
             PageType::IndexInterior => {
-                // Similar a TableInterior pero con estructura diferente
-                let mid_cell = match &page.cells[split_point as usize] {
-                    BTreeCell::IndexInterior(cell) => cell,
-                    _ => unreachable!("Tipo de celda incorrecto"),
-                };
-                
-                BTreeNode::create_interior(self.node_type, mid_cell.left_child_page, self.pager)?
+            
+                BTreeNode::create_interior(self.node_type, Rc::clone(&self.pager))?
             },
             PageType::Free => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "No se puede dividir un nodo de tipo Free",
+                    "Cannot divide a Free page",
                 ));
             },
             PageType::Overflow => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "No se puede dividir un nodo de tipo Overflow",
+                    "Cannot divide  an Overflow page",
                 ));
             },
         };
         
-        // Mover las celdas después del punto de división al nuevo nodo
+        // Move half of the cells to the new node
         let cells_to_move = page.cells.split_off(split_point as usize);
         let cell_indices_to_move = page.cell_indices.split_off(split_point as usize);
         
-        // Actualizar el contador de celdas del nodo actual
+        // Update the cell count of the original node
         page.header.cell_count = split_point;
         
-        // Mover las celdas al nuevo nodo
-        let new_page = new_node.get_page_mut()?;
+        // Move the cells to the new node
+        let mut new_page = new_node.get_page_mut()?;
         new_page.cells = cells_to_move;
         new_page.cell_indices = cell_indices_to_move;
         new_page.header.cell_count = cell_count - split_point;
         
-        // Para nodos interiores, necesitamos actualizar el hijo más a la derecha
+        // For interior nodes, we need to update the right-most child
         if self.node_type.is_interior() {
             if let Some(right_most) = page.header.right_most_page {
                 new_page.header.right_most_page = Some(right_most);
                 
-                // La celda mediana se convierte en el nuevo punto de división
+                // The middle cell is the one that will be moved to the new node
                 let mid_cell = match self.node_type {
                     PageType::TableInterior => {
-                        let cell = match &page.cells[split_point as usize - 1] {
-                            BTreeCell::TableInterior(cell) => cell,
+                        let (left_child_page, key) = match &page.cells[split_point as usize - 1] {
+                            BTreeCell::TableInterior(cell) => (cell.left_child_page, cell.key),
                             _ => unreachable!("Tipo de celda incorrecto"),
                         };
-                        
-                        // El hijo más a la derecha del nodo original se convierte en
-                        // el hijo más a la izquierda del nuevo nodo
-                        page.header.right_most_page = Some(cell.left_child_page);
-                        
-                        cell.key
+
+                        // The left child page of the new node is the right-most child of the original node
+                    
+                        page.header.right_most_page = Some(left_child_page);
+
+                        key
                     },
                     PageType::IndexInterior => {
-                        let cell = match &page.cells[split_point as usize - 1] {
+                        let _cell = match &page.cells[split_point as usize - 1] {
                             BTreeCell::IndexInterior(cell) => cell,
                             _ => unreachable!("Tipo de celda incorrecto"),
                         };
-                        
-                        // Similar a TableInterior pero debe extraer la clave del payload
-                        // En una implementación completa, se extraería la clave del payload
-                        // Por simplicidad, usamos un valor ficticio
-                        42 // Valor ficticio, en una implementación real se extraería del payload
+                        // To move the cell to the new node, we need to update the left child page
+                        42
                     },
                     _ => unreachable!("Tipo de nodo incorrecto"),
                 };
