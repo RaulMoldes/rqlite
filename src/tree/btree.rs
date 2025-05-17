@@ -11,11 +11,11 @@ use std::cell::RefCell;
 
 use crate::page::{Page, PageType, BTreeCell};
 use crate::storage::Pager;
-use crate::btree::node::BTreeNode;
-use crate::btree::cell::BTreeCellFactory;
-use crate::btree::record::Record;
+use crate::tree::node::BTreeNode;
+use crate::tree::cell::BTreeCellFactory;
+use crate::tree::record::Record;
 use crate::utils::cmp::KeyValue;
-use crate::btree::node::extract_key_from_payload;
+use crate::tree::node::extract_key_from_payload;
 use std::hash::Hasher;
 /// Represents a B-Tree in SQLite.
 ///
@@ -235,9 +235,9 @@ impl BTree {
         
         // Start at the root page
         let mut current_page = self.root_page;
-        let mut is_leaf = false;
+   
         let mut current_type = self.get_page_type(current_page)?;
-        is_leaf = current_type.is_leaf();
+        let mut is_leaf = current_type.is_leaf();
         
         // Traverse the tree until we reach a leaf node
         while !is_leaf {
@@ -310,9 +310,9 @@ impl BTree {
         
         // Start at the root page
         let mut current_page = self.root_page;
-        let mut is_leaf = false;
+        
         let mut current_type = self.get_page_type(current_page)?;
-        is_leaf = current_type.is_leaf();
+        let mut is_leaf = current_type.is_leaf();
         
         // Traverse the tree until we reach a leaf node
         while !is_leaf {
@@ -444,7 +444,6 @@ impl BTree {
         
         // Create a payload that contains both the key and rowid
         // Format: [key, rowid]
-        let mut record = Record::new();
         
         // Extract key value for comparison
         let key_value = extract_key_from_payload(key)?;
@@ -481,7 +480,7 @@ impl BTree {
         };
         
         // Find the leaf node where the key should be inserted
-        let (found, leaf_page, index) = self.find_index_key(&key_value)?;
+        let (_found, leaf_page, _index) = self.find_index_key(&key_value)?;
         let leaf_node = BTreeNode::open(leaf_page, PageType::IndexLeaf, Rc::clone(&self.pager))?;
         
         // Try to insert the cell
@@ -758,11 +757,10 @@ impl BTree {
     fn find_leaf_for_insert(&self, key: i64) -> io::Result<(u32, Vec<u32>)> {
         let mut current_page = self.root_page;
         let mut path = Vec::new();
-        let mut is_leaf = false;
-        
+     
         // Get the root page type
         let root_type = self.get_page_type(current_page)?;
-        is_leaf = root_type.is_leaf();
+        let mut is_leaf = root_type.is_leaf();
         let mut current_type = root_type;
         
         // Traverse the tree until we reach a leaf
@@ -802,11 +800,11 @@ fn get_path_to_leaf(&self, leaf_page: u32, key: &KeyValue) -> io::Result<Vec<u32
     
     let mut current_page = self.root_page;
     let mut path = Vec::new();
-    let mut is_leaf = false;
+    
     
     // Get the root page type
     let root_type = self.get_page_type(current_page)?;
-    is_leaf = root_type.is_leaf();
+    let mut is_leaf = root_type.is_leaf();
     let mut current_type = root_type;
     
     // Traverse the tree until we reach a leaf
@@ -1127,12 +1125,12 @@ fn find_siblings(&self, parent_node: BTreeNode, node_page: u32) -> io::Result<(O
     
     // Find the position of node_page in the parent
     let mut pos = None;
-    let mut is_rightmost = false;
+   // let mut is_rightmost = false;
     
     // Check if node is the rightmost child
     let rightmost = parent_node.get_right_most_child()?;
     if rightmost == node_page {
-        is_rightmost = true;
+       // let is_rightmost = true;
         pos = Some(cell_count);
     }
     

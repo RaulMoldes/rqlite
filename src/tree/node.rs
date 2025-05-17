@@ -497,21 +497,34 @@ pub fn find_index_key(&self, index_key: &KeyValue) -> io::Result<(bool, u16)> {
                 _ => unreachable!("Incorrect cell type"),
             };
             
-            if mid_key == key {
-                // Found an exact match
-                let left_child = match cell {
-                    BTreeCell::TableInterior(cell) => cell.left_child_page,
-                    _ => unreachable!("Incorrect cell type"),
-                };
-                
-                return Ok((true, left_child, mid_idx));
-            } else if mid_key > key {
-                // The key is to the left
-                right = mid - 1;
-            } else {
-                // The key is to the right
-                left = mid + 1;
+            match mid_key.partial_cmp(&key){
+                Some(std::cmp::Ordering::Equal) => {
+                    // Found an exact match
+                    let left_child = match cell {
+                        BTreeCell::TableInterior(cell) => cell.left_child_page,
+                        _ => unreachable!("Incorrect cell type"),
+                    };
+                    
+                    return Ok((true, left_child, mid_idx));
+                },
+                Some(std::cmp::Ordering::Greater) => {
+                    // The key is to the left
+                    right = mid - 1;
+                },
+                Some(std::cmp::Ordering::Less) => {
+                    // The key is to the right
+                    left = mid + 1;
+                },
+                None => {
+                    // This should not happen with our implementation
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Incomparable key types",
+                    ));
+                }
+
             }
+            
         }
         
         // No exact match found

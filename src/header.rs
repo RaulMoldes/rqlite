@@ -129,8 +129,10 @@ impl Header {
     }
 
     /// Creates a new header with a specified page size.
+    /// 
     /// Parameters:
     /// * `page_size` - Size of the page in bytes. Must be a power of 2 between 512 and 65536.
+    /// 
     /// Returns an `io::Result` with the header.
     pub fn with_page_size(page_size: u32) -> io::Result<Self> {
         if !is_valid_page_size(page_size) {
@@ -146,8 +148,10 @@ impl Header {
     }
 
     /// Reads a header from a source. The source must implement the `Read` trait.
+    /// 
     /// Parameters:
     /// * `reader` - Source that implements `Read`.
+    /// 
     /// Returns an `io::Result` with the header.
     pub fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
         let mut buffer = [0u8; HEADER_SIZE];
@@ -212,8 +216,10 @@ impl Header {
     }
 
     /// Writes the header to a destination. The destination must implement the `Write` trait.
+    /// 
     /// Parameters:
     /// * `writer` - Destination that implements `Write`.
+    /// 
     /// Returns an `io::Result` indicating success or failure.
     ///
     /// # Errors
