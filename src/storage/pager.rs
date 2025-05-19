@@ -14,6 +14,8 @@ use crate::page::{
     IndexLeafCell, OverflowPage, Page, PageType, TableInteriorCell, TableLeafCell,
 };
 
+use std::cell::RefCell;
+
 /// Handles the loading and caching of database pages.
 /// Maintains a buffer pool of pages in memory and manages the interaction with the disk.
 /// It is responsible for reading and writing pages to and from the disk, as well as
@@ -25,9 +27,9 @@ use crate::page::{
 /// The `Pager` struct is the main interface for interacting with the database pages.
 pub struct Pager {
     /// Disk manager.
-    disk_manager: DiskManager,
+    disk_manager: RefCell<DiskManager>, // Switched to RefCell for interior mutability
     /// Page Cache. This should be a BufferPool, but for now it is just a HashMap.
-    page_cache: BufferPool,
+    page_cache: RefCell<BufferPool>,
     /// Size of each page in bytes.
     /// This is the size of the page that is going to be used in the database.
     page_size: u32,
@@ -56,8 +58,8 @@ impl Pager {
         let header = disk_manager.read_header()?;
 
         Ok(Pager {
-            disk_manager,
-            page_cache: BufferPool::new(buffer_pool_size.unwrap_or(1000)),
+            disk_manager:RefCell::new(disk_manager),
+            page_cache: RefCell::new(BufferPool::new(buffer_pool_size.unwrap_or(1000))),
             page_size: header.page_size,
             reserved_space: header.reserved_space,
             dirty: false,
@@ -90,8 +92,8 @@ impl Pager {
         disk_manager.write_header(&header)?;
 
         Ok(Pager {
-            disk_manager,
-            page_cache: BufferPool::new(buffer_pool_size.unwrap_or(1000)),
+            disk_manager: RefCell::new(disk_manager),
+            page_cache: RefCell::new(BufferPool::new(buffer_pool_size.unwrap_or(1000))),
             page_size,
             reserved_space,
             dirty: false,
@@ -99,8 +101,8 @@ impl Pager {
     }
 
     /// Obtains the header of the database from the disk manager.
-    pub fn get_header(&mut self) -> io::Result<Header> {
-        self.disk_manager.read_header()
+    pub fn get_header(&self) -> io::Result<Header> {
+        self.disk_manager.borrow_mut().read_header()
     }
 
     /// Updates the header of the database in the disk manager.
@@ -114,13 +116,13 @@ impl Pager {
     /// # Returns
     /// A result indicating success or failure.
     pub fn update_header(&mut self, header: &Header) -> io::Result<()> {
-        self.disk_manager.write_header(header)?;
+        self.disk_manager.borrow_mut().write_header(header)?;
         self.dirty = true; // Not really needed i think, but let's keep it for consistency
         Ok(())
     }
 
     pub fn unpin_page(&mut self, page_number: u32) -> bool {
-        self.page_cache.unpin_page(page_number)
+        self.page_cache.borrow_mut().unpin_page(page_number)
     }
 
     /// Obtains a page from the database, loading it from disk if necessary.
@@ -136,9 +138,9 @@ impl Pager {
     ///
     /// # Returns
     /// A reference to the page.
-    pub fn get_page(&mut self, page_number: u32, page_type: Option<PageType>) -> io::Result<&Page> {
+    pub fn get_page(&self, page_number: u32, page_type: Option<PageType>) -> io::Result<&Page> {
         // Try to get from BufferPool
-        if !self.page_cache.contains_page(page_number) {
+        if !self.page_cache.borrow().contains_page(page_number) {
             // Load from disk into buffer pool
             self.load_page(page_number)?;
             // Get from buffer pool
@@ -146,7 +148,7 @@ impl Pager {
 
         // Verify the type of the page if it was specified
         if let Some(expected_type) = page_type {
-            match self.page_cache.get_page(page_number) {
+            match self.page_cache.borrow().get_page(page_number) {
                 Some(Page::BTree(btree_page)) => {
                     if btree_page.header.page_type != expected_type {
                         return Err(io::Error::new(
@@ -185,15 +187,12 @@ impl Pager {
         }
 
         // Mark the page as dirty (modified)
-        self.dirty = true; // ?? Not sure of this. It can be improved when the BufferPool is implemented
+      //  self.dirty = true; // ?? Not sure of this. It can be improved when the BufferPool is implemented
 
         // Return the reference to the page
-        self.page_cache.get_page(page_number).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Page not found: {}", page_number),
-            )
-        })
+        let page = self.page_cache.borrow().get_page(page_number)?;
+        
+        Ok(page)
     }
 
     /// Similar to `get_page`, but returns a mutable reference to the page.
@@ -213,14 +212,14 @@ impl Pager {
         page_number: u32,
         page_type: Option<PageType>,
     ) -> io::Result<&mut Page> {
-        if !self.page_cache.contains_page(page_number) {
+        if !self.page_cache.borrow().contains_page(page_number) {
             // Load the page from disk if it is not in the cache
             self.load_page(page_number)?;
         }
 
         // Verify the type of page if it was specified
         if let Some(expected_type) = page_type {
-            match self.page_cache.get_page(page_number) {
+            match self.page_cache.borrow().get_page(page_number) {
                 Some(Page::BTree(btree_page)) => {
                     if btree_page.header.page_type != expected_type {
                         return Err(io::Error::new(
@@ -259,15 +258,13 @@ impl Pager {
         }
 
         // Mark the page as dirty (modified)
-        self.dirty = true;
+       // self.dirty = true;
 
         // Return the mutable reference to the page
-        self.page_cache.get_page_mut(page_number).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Page not found: {}", page_number),
-            )
-        })
+        let page = self.page_cache.borrow().get_page_mut(page_number)?;
+        Ok(page)
+        
+        
     }
 
     /// Caches a page in memory.
@@ -279,9 +276,13 @@ impl Pager {
     ///
     /// # Errors
     /// Returns an error if the page cannot be loaded from disk.
-    fn load_page(&mut self, page_number: u32) -> io::Result<()> {
+    fn load_page(&self, page_number: u32) -> io::Result<()> {
         // Verify if the page number is valid
-        let page_count = self.disk_manager.page_count()?;
+        let page_count = {
+            let manager = self.disk_manager.borrow();
+            manager.page_count()?
+        };
+
         if (page_number) > (page_count + 1) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -295,7 +296,7 @@ impl Pager {
 
         // Retrieve the page from disk
         let mut buffer = vec![0u8; self.page_size as usize]; // Allocate a buffer for the page
-        self.disk_manager.read_page(page_number, &mut buffer)?;
+        self.disk_manager.borrow_mut().read_page(page_number, &mut buffer)?;
 
         // Interpret the page based on its type
         // The first byte of the page indicates the type of page. Page 1 is always a B-Tree page.
@@ -323,10 +324,10 @@ impl Pager {
     ///
     /// # Returns
     /// A result indicating success or failure.
-    fn add_page_to_cache(&mut self, page_number: u32, page: Page) -> io::Result<()> {
+    fn add_page_to_cache(&self, page_number: u32, page: Page) -> io::Result<()> {
         // Add the page to the cache
 
-        match self.page_cache.add_page(page_number, page, true) {
+        match self.page_cache.borrow_mut().add_page(page_number, page, true) {
             Some((evicted_page_number, _)) => {
                 if evicted_page_number == page_number {
                     Err(io::Error::new(
@@ -494,7 +495,7 @@ impl Pager {
         right_most_page: Option<u32>,
     ) -> io::Result<u32> {
         // Asign a new page
-        let page_number = self.disk_manager.allocate_pages(1)?;
+        let page_number = self.disk_manager.borrow_mut().allocate_pages(1)?;
 
         // Create the B-Tree page
         let btree_page = BTreePage::new(
@@ -536,7 +537,7 @@ impl Pager {
         }
 
         // Asign a new page
-        let page_number = self.disk_manager.allocate_pages(1)?;
+        let page_number = self.disk_manager.borrow_mut().allocate_pages(1)?;
 
         // Create the overflow page
         let overflow_page = OverflowPage::new(next_page, data, self.page_size, page_number)?;
@@ -560,7 +561,7 @@ impl Pager {
     /// Number of the created page.
     pub fn create_free_page(&mut self, next_page: u32) -> io::Result<u32> {
         // Add a new page
-        let page_number = self.disk_manager.allocate_pages(1)?;
+        let page_number = self.disk_manager.borrow_mut().allocate_pages(1)?;
 
         // Create the free page
         let free_page = FreePage::new(next_page, self.page_size, page_number);
@@ -580,7 +581,7 @@ impl Pager {
             return Ok(());
         }
 
-        let dirty_pages = self.page_cache.get_dirty_pages_referenced();
+        let dirty_pages = self.page_cache.borrow().get_dirty_pages_referenced();
         if dirty_pages.is_empty() {
             return Ok(());
         }
@@ -589,11 +590,11 @@ impl Pager {
             let buffer = self.serialize_page(page)?;
 
             // Write the page to disk
-            self.disk_manager.write_page(page_number, &buffer)?;
+            self.disk_manager.borrow_mut().write_page(page_number, &buffer)?;
         }
 
         // Sync the disk manager to ensure all data is written
-        self.disk_manager.sync()?;
+        self.disk_manager.borrow_mut().sync()?;
 
         self.dirty = false;
         Ok(())
@@ -627,7 +628,7 @@ impl Pager {
     /// # Returns
     /// The number of pages in the database.
     pub fn page_count(&self) -> io::Result<u32> {
-        self.disk_manager.page_count()
+        self.disk_manager.borrow().page_count()
     }
 
     /// Closes the pager and flushes any dirty pages to disk.
