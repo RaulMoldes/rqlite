@@ -9,6 +9,7 @@ readme = "README.md"
 repository = "https://github.com/RaulMoldes/rqlite"
 
 [dependencies]
+rustfmt = "0.10.0"
 # No external dependencies 
 
 [dev-dependencies]

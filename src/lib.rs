@@ -1,12 +1,12 @@
 //! # SQLite Storage Engine
-//! 
+//!
 //! Este crate implementa un motor de almacenamiento compatible con SQLite,
 //! siguiendo el formato de archivo SQLite versión 3. La implementación se centra
 //! en la parte de almacenamiento, incluyendo el manejo de páginas, árboles B-Tree
 //! y serialización/deserialización de datos.
-//! 
+//!
 //! ## Estructura
-//! 
+//!
 //! - `header`: Implementación del encabezado de la base de datos.
 //! - `page`: Definición de las páginas y tipos de páginas.
 //! - `btree`: Implementación de los árboles B-Tree utilizados para tablas e índices.
@@ -15,8 +15,8 @@
 
 pub mod header;
 pub mod page;
-pub mod tree;
 pub mod storage;
+pub mod tree;
 pub mod utils;
 /*
 /// Versión del formato SQLite implementado.
@@ -135,7 +135,7 @@ impl Database {
     pub fn create_table(&mut self) -> std::io::Result<btree::BTree> {
         // Obtener los valores para la configuración del B-Tree desde el encabezado
         let header = self.get_header()?;
-        
+
         btree::BTree::create(
             btree::TreeType::Table,
             &mut self.pager as *mut _,
@@ -156,7 +156,7 @@ impl Database {
     pub fn create_index(&mut self) -> std::io::Result<btree::BTree> {
         // Obtener los valores para la configuración del B-Tree desde el encabezado
         let header = self.get_header()?;
-        
+
         btree::BTree::create(
             btree::TreeType::Index,
             &mut self.pager as *mut _,
@@ -185,7 +185,7 @@ impl Database {
     ) -> std::io::Result<btree::BTree> {
         // Obtener los valores para la configuración del B-Tree desde el encabezado
         let header = self.get_header()?;
-        
+
         btree::BTree::open(
             root_page,
             tree_type,
@@ -219,106 +219,106 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use tempfile::tempdir;
-    
+
     #[test]
     fn test_create_database() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        
+
         // Crear una base de datos
         let db = Database::create(&db_path, 4096, 0);
         assert!(db.is_ok());
-        
+
         // Verificar que el archivo existe
         assert!(db_path.exists());
     }
-    
+
     #[test]
     fn test_open_database() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        
+
         // Crear una base de datos
         {
             let _db = Database::create(&db_path, 4096, 0).unwrap();
         }
-        
+
         // Abrir la base de datos existente
         let db = Database::open(&db_path);
         assert!(db.is_ok());
     }
-    
+
     #[test]
     fn test_create_btree_node() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        
+
         // Crear una base de datos
         let mut db = Database::create(&db_path, 4096, 0).unwrap();
-        
+
         // Crear un nodo B-Tree hoja
         let node = db.create_btree_leaf(page::PageType::TableLeaf);
         assert!(node.is_ok());
-        
+
         // Verificar que el nodo se creó correctamente
         let node = node.unwrap();
         assert_eq!(node.node_type, page::PageType::TableLeaf);
         assert_eq!(node.cell_count().unwrap(), 0);
     }
-    
+
     #[test]
     fn test_create_and_open_btree_node() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        
+
         // Crear una base de datos
         let mut db = Database::create(&db_path, 4096, 0).unwrap();
-        
+
         // Crear un nodo B-Tree hoja
         let node = db.create_btree_leaf(page::PageType::TableLeaf).unwrap();
         let page_number = node.page_number;
-        
+
         // Guardar cambios
         db.commit().unwrap();
-        
+
         // Abrir el nodo de nuevo
         let node2 = db.open_btree_node(page_number, page::PageType::TableLeaf);
         assert!(node2.is_ok());
-        
+
         let node2 = node2.unwrap();
         assert_eq!(node2.node_type, page::PageType::TableLeaf);
         assert_eq!(node2.page_number, page_number);
     }
-    
+
     #[test]
     fn test_header_operations() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        
+
         // Crear una base de datos
         let mut db = Database::create(&db_path, 4096, 0).unwrap();
-        
+
         // Leer el encabezado
         let mut header = db.get_header().unwrap();
         assert_eq!(header.page_size, 4096);
-        
+
         // Modificar el encabezado
         header.user_version = 42;
         db.update_header(&header).unwrap();
-        
+
         // Leer de nuevo el encabezado
         let header2 = db.get_header().unwrap();
         assert_eq!(header2.user_version, 42);
     }
-    
+
     #[test]
     fn test_close_database() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        
+
         // Crear una base de datos
         let db = Database::create(&db_path, 4096, 0).unwrap();
-        
+
         // Cerrar la base de datos
         let result = db.close();
         assert!(result.is_ok());

@@ -1,10 +1,10 @@
 //! # Header Module
-//! 
+//!
 //! This module defines the structure and functionality for handling the SQLite database header.
 //! It includes methods for reading and writing the header, as well as validating the page size.
 //! The header is a 100-byte structure that contains the metadata about the SQLite database file.
 //! Link to SQLite documentation: https://www.sqlite.org/fileformat.html#fileformat_header
-//! 
+//!
 //! HEADER STRUCTURE
 //! page_size: u32, // Size of a page in bytes
 //! write_version: u8, // Write version of the database
@@ -28,8 +28,8 @@
 //! reserved: [u8; 20], // Reserved for future expansion
 //! version_valid_for: u32, // Version valid for
 //! sqlite_version_number: u32, // SQLite version number
-//! 
-//! 
+//!
+//!
 //! Currently I am serializing the header in big-endian format. This can be improved with a more dynamic approach if I am able to detect the endianness of the system..
 //
 use std::fmt;
@@ -93,7 +93,7 @@ pub struct Header {
 
 impl Default for Header {
     /// Creates a new header with default values.
-    /// 
+    ///
     fn default() -> Self {
         Header {
             page_size: 4096,
@@ -129,16 +129,19 @@ impl Header {
     }
 
     /// Creates a new header with a specified page size.
-    /// 
+    ///
     /// Parameters:
     /// * `page_size` - Size of the page in bytes. Must be a power of 2 between 512 and 65536.
-    /// 
+    ///
     /// Returns an `io::Result` with the header.
     pub fn with_page_size(page_size: u32) -> io::Result<Self> {
         if !is_valid_page_size(page_size) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Invalid PAGE SIZE: {}. Should be a power of 2 between 512 and 65536", page_size),
+                format!(
+                    "Invalid PAGE SIZE: {}. Should be a power of 2 between 512 and 65536",
+                    page_size
+                ),
             ));
         }
 
@@ -148,10 +151,10 @@ impl Header {
     }
 
     /// Reads a header from a source. The source must implement the `Read` trait.
-    /// 
+    ///
     /// Parameters:
     /// * `reader` - Source that implements `Read`.
-    /// 
+    ///
     /// Returns an `io::Result` with the header.
     pub fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
         let mut buffer = [0u8; HEADER_SIZE];
@@ -195,15 +198,25 @@ impl Header {
             leaf_payload_fraction: buffer[23],
             change_counter: u32::from_be_bytes([buffer[24], buffer[25], buffer[26], buffer[27]]),
             database_size: u32::from_be_bytes([buffer[28], buffer[29], buffer[30], buffer[31]]),
-            first_freelist_trunk_page: u32::from_be_bytes([buffer[32], buffer[33], buffer[34], buffer[35]]),
+            first_freelist_trunk_page: u32::from_be_bytes([
+                buffer[32], buffer[33], buffer[34], buffer[35],
+            ]),
             freelist_pages: u32::from_be_bytes([buffer[36], buffer[37], buffer[38], buffer[39]]),
             schema_cookie: u32::from_be_bytes([buffer[40], buffer[41], buffer[42], buffer[43]]),
-            schema_format_number: u32::from_be_bytes([buffer[44], buffer[45], buffer[46], buffer[47]]),
-            default_cache_size: u32::from_be_bytes([buffer[48], buffer[49], buffer[50], buffer[51]]),
-            largest_root_btree_page: u32::from_be_bytes([buffer[52], buffer[53], buffer[54], buffer[55]]),
+            schema_format_number: u32::from_be_bytes([
+                buffer[44], buffer[45], buffer[46], buffer[47],
+            ]),
+            default_cache_size: u32::from_be_bytes([
+                buffer[48], buffer[49], buffer[50], buffer[51],
+            ]),
+            largest_root_btree_page: u32::from_be_bytes([
+                buffer[52], buffer[53], buffer[54], buffer[55],
+            ]),
             text_encoding: u32::from_be_bytes([buffer[56], buffer[57], buffer[58], buffer[59]]),
             user_version: u32::from_be_bytes([buffer[60], buffer[61], buffer[62], buffer[63]]),
-            incremental_vacuum_mode: u32::from_be_bytes([buffer[64], buffer[65], buffer[66], buffer[67]]),
+            incremental_vacuum_mode: u32::from_be_bytes([
+                buffer[64], buffer[65], buffer[66], buffer[67],
+            ]),
             application_id: u32::from_be_bytes([buffer[68], buffer[69], buffer[70], buffer[71]]),
             reserved: {
                 let mut reserved = [0u8; 20];
@@ -211,15 +224,17 @@ impl Header {
                 reserved
             },
             version_valid_for: u32::from_be_bytes([buffer[92], buffer[93], buffer[94], buffer[95]]),
-            sqlite_version_number: u32::from_be_bytes([buffer[96], buffer[97], buffer[98], buffer[99]]),
+            sqlite_version_number: u32::from_be_bytes([
+                buffer[96], buffer[97], buffer[98], buffer[99],
+            ]),
         })
     }
 
     /// Writes the header to a destination. The destination must implement the `Write` trait.
-    /// 
+    ///
     /// Parameters:
     /// * `writer` - Destination that implements `Write`.
-    /// 
+    ///
     /// Returns an `io::Result` indicating success or failure.
     ///
     /// # Errors
@@ -289,7 +304,11 @@ impl fmt::Display for Header {
         writeln!(f, "  Change Counter: {}", self.change_counter)?;
         writeln!(f, "  Database Size: {} pages", self.database_size)?;
         writeln!(f, "  Schema Format Number: {}", self.schema_format_number)?;
-        writeln!(f, "  Text Encoding: {}", text_encoding_to_string(self.text_encoding))?;
+        writeln!(
+            f,
+            "  Text Encoding: {}",
+            text_encoding_to_string(self.text_encoding)
+        )?;
         writeln!(f, "  User Version: {}", self.user_version)?;
         writeln!(f, "  Application ID: {:#x}", self.application_id)?;
         writeln!(f, "  SQLite Version: {}", self.sqlite_version_number)
@@ -312,7 +331,7 @@ fn is_valid_page_size(size: u32) -> bool {
     if size < 512 || size > 65536 {
         return false;
     }
-    
+
     // Verifies if the size is a power of 2
     // A number is a power of 2 if it has only one bit set in its binary representation
     (size & (size - 1)) == 0
@@ -367,19 +386,22 @@ mod tests {
     fn test_header_serialization() {
         let header = Header::default();
         let mut buffer = Vec::new();
-        
+
         // Escribir el encabezado en el buffer
         header.write_to(&mut buffer).unwrap();
-        
+
         // Leer el encabezado del buffer
         let mut cursor = Cursor::new(buffer);
         let read_header = Header::read_from(&mut cursor).unwrap();
-        
+
         // Verificar que los valores coincidan
         assert_eq!(header.page_size, read_header.page_size);
         assert_eq!(header.write_version, read_header.write_version);
         assert_eq!(header.read_version, read_header.read_version);
-        assert_eq!(header.schema_format_number, read_header.schema_format_number);
+        assert_eq!(
+            header.schema_format_number,
+            read_header.schema_format_number
+        );
     }
 
     #[test]
@@ -392,7 +414,7 @@ mod tests {
         assert!(is_valid_page_size(16384));
         assert!(is_valid_page_size(32768));
         assert!(is_valid_page_size(65536));
-        
+
         // Tamaños inválidos
         assert!(!is_valid_page_size(511)); // Menor que el mínimo
         assert!(!is_valid_page_size(513)); // No es potencia de 2

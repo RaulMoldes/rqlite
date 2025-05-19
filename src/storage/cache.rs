@@ -1,7 +1,7 @@
 // src/storage/buffer_pool.rs
 
-use std::collections::{HashMap, VecDeque};
 use crate::page::Page;
+use std::collections::{HashMap, VecDeque};
 
 /// Represents a frame in the buffer pool that holds a page.
 /// The frame contains metadata about the page, such as pin count and dirty flag.
@@ -118,14 +118,14 @@ impl BufferPool {
         if self.frames.contains_key(&page_number) {
             // Update the page's position in the LRU list
             self.touch_page(page_number);
-            
+
             // Pin the page
             if let Some(frame) = self.frames.get_mut(&page_number) {
                 frame.pin();
                 return Some(frame.page());
             }
         }
-        
+
         None
     }
 
@@ -140,7 +140,7 @@ impl BufferPool {
         if self.frames.contains_key(&page_number) {
             // Update the page's position in the LRU list
             self.touch_page(page_number);
-            
+
             // Pin the page and mark it as dirty
             if let Some(frame) = self.frames.get_mut(&page_number) {
                 frame.pin();
@@ -148,7 +148,7 @@ impl BufferPool {
                 return Some(frame.page_mut());
             }
         }
-        
+
         None
     }
 
@@ -163,24 +163,26 @@ impl BufferPool {
     /// Option containing page number and page that was evicted, if any
     pub fn add_page(&mut self, page_number: u32, page: Page, pin: bool) -> Option<(u32, Page)> {
         // Check if we need to evict a page
-     
-        let evicted = if self.frames.len() >= self.max_pages && !self.frames.contains_key(&page_number) {
-            // ATTEMPT TO EVICT A PAGE
-            self.evict_page()
-        } else {
-            None
-        };
-       
 
-        if evicted.is_none() && self.frames.len() >= self.max_pages && !self.frames.contains_key(&page_number) {
+        let evicted =
+            if self.frames.len() >= self.max_pages && !self.frames.contains_key(&page_number) {
+                // ATTEMPT TO EVICT A PAGE
+                self.evict_page()
+            } else {
+                None
+            };
+
+        if evicted.is_none()
+            && self.frames.len() >= self.max_pages
+            && !self.frames.contains_key(&page_number)
+        {
             // If we couldn't evict a page, return the requested page (rejected)
             return Some((page_number, page));
         }
-        
-        
+
         // Create a new frame for this page
         let mut frame = BufferFrame::new(page);
-        
+
         // Pin the page if requested
         if pin {
             frame.pin();
@@ -188,10 +190,10 @@ impl BufferPool {
             // If not pinned, add to LRU list
             self.lru_list.push_back(page_number);
         }
-        
+
         // Add the frame to the buffer pool
         self.frames.insert(page_number, frame);
-        
+
         evicted
     }
 
@@ -213,7 +215,7 @@ impl BufferPool {
             }
             return true;
         }
-        
+
         false
     }
 
@@ -229,7 +231,7 @@ impl BufferPool {
             frame.mark_dirty();
             return true;
         }
-        
+
         false
     }
 
@@ -245,7 +247,7 @@ impl BufferPool {
             frame.reset_dirty();
             return true;
         }
-        
+
         false
     }
 
@@ -254,22 +256,23 @@ impl BufferPool {
     /// # Returns
     /// Vector of page numbers for dirty pages
     pub fn get_dirty_pages(&self) -> Vec<u32> {
-        self.frames.iter()
+        self.frames
+            .iter()
             .filter(|(_, frame)| frame.is_dirty())
             .map(|(page_number, _)| *page_number)
             .collect()
     }
 
-     /// Gets a list of all dirty pages in the buffer pool
+    /// Gets a list of all dirty pages in the buffer pool
     ///
     /// # Returns
     /// Vector of page refrences for dirty pages
     pub fn get_dirty_pages_referenced(&self) -> Vec<(u32, &Page)> {
-        self.frames.iter()
+        self.frames
+            .iter()
             .filter(|(_, frame)| frame.is_dirty())
             .map(|(page_number, frame)| (*page_number, &frame.page))
             .collect()
-        
     }
 
     /// Removes a page from the buffer pool
@@ -289,10 +292,10 @@ impl BufferPool {
         } else {
             return None;
         }
-        
+
         // Remove the page from the LRU list
         self.lru_list.retain(|&p| p != page_number);
-        
+
         // Remove and return the page
         self.frames.remove(&page_number).map(|frame| frame.page)
     }
@@ -304,25 +307,23 @@ impl BufferPool {
     fn evict_page(&mut self) -> Option<(u32, Page)> {
         // Try to find an unpinned page in the LRU list
         while let Some(page_number) = self.lru_list.pop_front() {
-          
             // Check if the page is still in the buffer pool
             if let Some(frame) = self.frames.get(&page_number) {
                 // Cannot evict a pinned page
                 if frame.is_pinned() {
                     // Push the page to the back of the LRU list
                     self.lru_list.push_back(page_number);
-            
+
                     continue;
                 }
-                
+
                 // Remove the page from the buffer pool
                 if let Some(frame) = self.frames.remove(&page_number) {
-                  
                     return Some((page_number, frame.page));
                 }
             }
         }
-        
+
         // If we get here, all pages are pinned
         None
     }
@@ -334,7 +335,7 @@ impl BufferPool {
     fn touch_page(&mut self, page_number: u32) {
         // Remove the page from the LRU list
         self.lru_list.retain(|&p| p != page_number);
-        
+
         // Add the page to the back of the LRU list if it's not pinned
         if let Some(frame) = self.frames.get(&page_number) {
             if !frame.is_pinned() {
@@ -361,7 +362,8 @@ impl BufferPool {
     /// # Returns
     /// true if the page is dirty, false if the page is not dirty or not in the buffer pool
     pub fn is_dirty(&self, page_number: u32) -> bool {
-        self.frames.get(&page_number)
+        self.frames
+            .get(&page_number)
             .map_or(false, |frame| frame.is_dirty())
     }
 
@@ -373,7 +375,8 @@ impl BufferPool {
     /// # Returns
     /// true if the page is pinned, false if the page is not pinned or not in the buffer pool
     pub fn is_pinned(&self, page_number: u32) -> bool {
-        self.frames.get(&page_number)
+        self.frames
+            .get(&page_number)
             .map_or(false, |frame| frame.is_pinned())
     }
 
@@ -385,7 +388,8 @@ impl BufferPool {
     /// # Returns
     /// The pin count of the page, or 0 if the page is not in the buffer pool
     pub fn pin_count(&self, page_number: u32) -> u32 {
-        self.frames.get(&page_number)
+        self.frames
+            .get(&page_number)
             .map_or(0, |frame| frame.pin_count)
     }
 }
@@ -393,7 +397,7 @@ impl BufferPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::page::{PageType, BTreePage, BTreePageHeader, Page};
+    use crate::page::{BTreePage, BTreePageHeader, Page, PageType};
 
     // Helper function to create a test page
     fn create_test_page(page_number: u32) -> Page {
@@ -433,7 +437,7 @@ mod tests {
         assert!(evicted.is_none());
         assert_eq!(pool.page_count(), 2);
         assert!(pool.contains_page(2));
-        
+
         // Page 2 should be pinned
         assert!(pool.is_pinned(2));
         assert!(!pool.is_pinned(1));
@@ -443,17 +447,17 @@ mod tests {
     fn test_get_page() {
         let mut pool = BufferPool::new(3);
         let page1 = create_test_page(1);
-        
+
         // Add a page
         pool.add_page(1, page1, false);
-        
+
         // Get the page
         let page = pool.get_page(1);
         assert!(page.is_some());
-        
+
         // Page should be pinned after get
         assert!(pool.is_pinned(1));
-        
+
         // Get a non-existent page
         let page = pool.get_page(2);
         assert!(page.is_none());
@@ -463,18 +467,18 @@ mod tests {
     fn test_get_page_mut() {
         let mut pool = BufferPool::new(3);
         let page1 = create_test_page(1);
-        
+
         // Add a page
         pool.add_page(1, page1, false);
-        
+
         // Get the page mutably
         let page = pool.get_page_mut(1);
         assert!(page.is_some());
-        
+
         // Page should be pinned and dirty after get_mut
         assert!(pool.is_pinned(1));
         assert!(pool.is_dirty(1));
-        
+
         // Get a non-existent page
         let page = pool.get_page_mut(2);
         assert!(page.is_none());
@@ -484,16 +488,16 @@ mod tests {
     fn test_unpin_page() {
         let mut pool = BufferPool::new(3);
         let page1 = create_test_page(1);
-        
+
         // Add a page and pin it
         pool.add_page(1, page1, true);
         assert!(pool.is_pinned(1));
-        
+
         // Unpin the page
         let result = pool.unpin_page(1);
         assert!(result);
         assert!(!pool.is_pinned(1));
-        
+
         // Unpin a non-existent page
         let result = pool.unpin_page(2);
         assert!(!result);
@@ -503,21 +507,21 @@ mod tests {
     fn test_dirty_flags() {
         let mut pool = BufferPool::new(3);
         let page1 = create_test_page(1);
-        
+
         // Add a page
         pool.add_page(1, page1, false);
         assert!(!pool.is_dirty(1));
-        
+
         // Mark the page as dirty
         let result = pool.mark_dirty(1);
         assert!(result);
         assert!(pool.is_dirty(1));
-        
+
         // Mark the page as clean
         let result = pool.mark_clean(1);
         assert!(result);
         assert!(!pool.is_dirty(1));
-        
+
         // Mark a non-existent page as dirty
         let result = pool.mark_dirty(2);
         assert!(!result);
@@ -529,16 +533,16 @@ mod tests {
         let page1 = create_test_page(1);
         let page2 = create_test_page(2);
         let page3 = create_test_page(3);
-        
+
         // Add pages
         pool.add_page(1, page1, false);
         pool.add_page(2, page2, false);
         pool.add_page(3, page3, false);
-        
+
         // Mark some pages as dirty
         pool.mark_dirty(1);
         pool.mark_dirty(3);
-        
+
         // Get dirty pages
         let dirty_pages = pool.get_dirty_pages();
         assert_eq!(dirty_pages.len(), 2);
@@ -550,23 +554,23 @@ mod tests {
     fn test_remove_page() {
         let mut pool = BufferPool::new(3);
         let page1 = create_test_page(1);
-        
+
         // Add a page
         pool.add_page(1, page1, false);
-        
+
         // Remove the page
         let removed = pool.remove_page(1);
         assert!(removed.is_some());
         assert!(!pool.contains_page(1));
-        
+
         // Remove a non-existent page
         let removed = pool.remove_page(1);
         assert!(removed.is_none());
-        
+
         // Add a page and pin it
         let page2 = create_test_page(2);
         pool.add_page(2, page2, true);
-        
+
         // Try to remove a pinned page
         let removed = pool.remove_page(2);
         assert!(removed.is_none());
@@ -579,21 +583,21 @@ mod tests {
         let page1 = create_test_page(1);
         let page2 = create_test_page(2);
         let page3 = create_test_page(3);
-        
+
         // Add pages
         pool.add_page(1, page1, false);
         pool.add_page(2, page2, false);
-        
+
         // Touch page 1 to make it more recently used
         pool.get_page(1);
         pool.unpin_page(1);
-        
+
         // Add another page, which should evict page 2 (least recently used)
         let evicted = pool.add_page(3, page3, false);
         assert!(evicted.is_some());
         let (evicted_page_number, _) = evicted.unwrap();
         assert_eq!(evicted_page_number, 2);
-        
+
         // Verify pages 1 and 3 are in the pool, but not 2
         assert!(pool.contains_page(1));
         assert!(!pool.contains_page(2));
@@ -606,35 +610,33 @@ mod tests {
         let page1 = create_test_page(1);
         let page2 = create_test_page(2);
         let page3 = create_test_page(3);
-        
+
         // Add pages and pin them
         let evicted = pool.add_page(1, page1, true);
         assert!(evicted.is_none());
         let evicted = pool.add_page(2, page2, true);
         assert!(evicted.is_none());
-        
+
         // Try to add another page, which should fail to evict any page because all are pinned
         let evicted = pool.add_page(3, page3.clone(), true);
         assert!(evicted.is_some()); // We should have rejected the page
         let (evicted_page_number, _) = evicted.unwrap();
         assert_eq!(evicted_page_number, 3); // The page we tried to add was rejected
         assert_eq!(pool.page_count(), 2); // Pool should still have 2 pages
-        
+
         // Pool should still have pages 1 and 2
         assert!(pool.contains_page(1));
         assert!(pool.contains_page(2));
-      
-        
+
         // Unpin page 1
         pool.unpin_page(1);
 
-        
         // Try to add page 3 again, which should evict page 1
         let evicted = pool.add_page(3, page3, true);
         assert!(evicted.is_some());
         let (evicted_page_number, _) = evicted.unwrap();
         assert_eq!(evicted_page_number, 1);
-        
+
         // Pool should now have pages 2 and 3
         assert!(!pool.contains_page(1));
         assert!(pool.contains_page(2));
