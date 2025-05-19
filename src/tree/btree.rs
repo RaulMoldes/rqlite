@@ -966,10 +966,10 @@ fn create_new_root(&mut self, left_node: BTreeNode, right_node: BTreeNode, media
     };
     
     // Create the new root node with right_node as its rightmost child
-    let new_root = BTreeNode::create_interior(root_type, Rc::clone(&self.pager))?;
+    let new_root = BTreeNode::create_interior(root_type, Some(right_node.page_number),  Rc::clone(&self.pager))?;
     
-    // Set the rightmost child
-    new_root.set_right_most_child(right_node.page_number)?;
+    // Set the rightmost child. Not needed
+    //new_root.set_right_most_child(right_node.page_number)?;
     
     // Create a cell pointing to the left node
     let cell = if self.tree_type == TreeType::Table {
