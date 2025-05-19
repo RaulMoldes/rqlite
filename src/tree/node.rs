@@ -644,20 +644,20 @@ pub fn find_index_key(&self, index_key: &KeyValue) -> io::Result<(bool, u16)> {
 /// - Median key (for interior nodes) or rowid (for leaf nodes)
 /// - Index of the median cell
 pub fn split(&self) -> io::Result<(BTreeNode, i64, u16)> {
-    
     let cell_count = {
         let page = &(self.get_page_owned()?);
         page.header.cell_count
     };
+    
     // Find the splitting point (middle of the node)
     let split_point = cell_count / 2;
     
     // Create a new node of the same type
     let new_node = match self.node_type {
         PageType::TableLeaf => BTreeNode::create_leaf(self.node_type, Rc::clone(&self.pager))?,
-        PageType::TableInterior => BTreeNode::create_interior(self.node_type, None,Rc::clone(&self.pager))?,
+        PageType::TableInterior => BTreeNode::create_interior(self.node_type, None, Rc::clone(&self.pager))?,
         PageType::IndexLeaf => BTreeNode::create_leaf(self.node_type, Rc::clone(&self.pager))?,
-        PageType::IndexInterior => BTreeNode::create_interior(self.node_type, None,Rc::clone(&self.pager))?,
+        PageType::IndexInterior => BTreeNode::create_interior(self.node_type, None, Rc::clone(&self.pager))?,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -666,150 +666,138 @@ pub fn split(&self) -> io::Result<(BTreeNode, i64, u16)> {
         }
     };
 
-    println!("Voy a obtener una referencia mutable al pager");
-    // Get mutable references to both pages
-    let mut orig_page = self.get_page_mut()?;
-    println!("He obtenido una referencia mutable al pager");
-    let mut new_page = new_node.get_page_mut()?;
-    println!("He obtenido una referencia mutable al otro pager");
-    // Move cells from the original page to the new page
-    let cells_to_move: Vec<BTreeCell> = orig_page.cells.drain(split_point as usize..).collect();
+    // SOLUCIÓN: Usar ámbitos separados para evitar préstamos simultáneos
     
-    // Move corresponding cell indices
-    let indices_to_move: Vec<u16> = orig_page.cell_indices.drain(split_point as usize..).collect();
-    
-    // Update cell counts
-    orig_page.header.cell_count = split_point;
-    new_page.header.cell_count = (cell_count - split_point) as u16;
-    
-    // Handle right-most child pointer for interior nodes
-    let median_key = if self.node_type.is_interior() {
-        if let Some(right_most) = orig_page.header.right_most_page {
-            // The original node's right-most child becomes the new node's right-most child
-            new_page.header.right_most_page = Some(right_most);
-            
-            // The right-most child of the original node needs to be updated
-            // to be the left child of the cell that will be promoted
-            match self.node_type {
-                PageType::TableInterior => {
-                    // Get the middle cell that will be promoted
-                    let (mid_left_child_page, mid_key) = match &orig_page.cells[(split_point - 1) as usize] {
-                        BTreeCell::TableInterior(cell) => (cell.left_child_page, cell.key),
-                        _ => unreachable!("Incorrect cell type"),
-                    };
-                    // Now update the right-most child of the original node
-                    orig_page.header.right_most_page = Some(mid_left_child_page);
-
-                    // Now add the cells to the new page
-                    for cell in cells_to_move {
-                        new_page.cells.push(cell);
-                    }
-                    
-                    // Add the indices to the new page
-                    for idx in indices_to_move {
-                        new_page.cell_indices.push(idx);
-                    }
-                    
-                    // Return the key that will be promoted to the parent
-                    (mid_key, split_point - 1)
-                },
-                PageType::IndexInterior => {
-                    // Similar logic for index interior nodes
-                    // First, extract the needed data from mid_cell to avoid borrow conflicts
-                    let (mid_payload, mid_left_child_page) = match &orig_page.cells[(split_point - 1) as usize] {
-                        BTreeCell::IndexInterior(cell) => (cell.payload.clone(), cell.left_child_page),
-                        _ => unreachable!("Incorrect cell type"),
-                    };
-
-                    // Now, update orig_page mutably
-                    orig_page.header.right_most_page = Some(mid_left_child_page);
-
-                    // Extract key from payload for index interior nodes
-                    let key_value = extract_key_from_payload(&mid_payload)?;
-                    let key = match key_value {
-                        KeyValue::Integer(i) => i,
-                        KeyValue::Float(f) => f as i64,
-                        _ => {
-                            // For string and blob, hash the key for API compatibility
-                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                            std::hash::Hash::hash(&key_value, &mut hasher);
-                            hasher.finish() as i64
-                        }
-                    };
-
-                    // Add cells to the new page
-                    for cell in cells_to_move {
-                        new_page.cells.push(cell);
-                    }
-
-                    // Add indices to the new page
-                    for idx in indices_to_move {
-                        new_page.cell_indices.push(idx);
-                    }
-
-                    (key, split_point - 1)
-                },
-                _ => unreachable!("Not an interior node"),
+    // Primero, obtener datos de la página original
+    let (cells_to_move, indices_to_move, orig_right_most_page, median_key) = {
+        let mut orig_page = self.get_page_mut()?;
+        
+        // Mover cells desde la página original a un vector temporal
+        let cells = orig_page.cells.drain(split_point as usize..).collect::<Vec<_>>();
+        let indices = orig_page.cell_indices.drain(split_point as usize..).collect::<Vec<_>>();
+        
+        // Actualizar contador de cells
+        orig_page.header.cell_count = split_point;
+        
+        // Guardar referencia al right-most page si es un nodo interior
+        let right_most = orig_page.header.right_most_page;
+        
+        // Calcular la clave mediana dependiendo del tipo de nodo
+        let median = if self.node_type.is_interior() {
+            if let Some(right_most) = right_most {
+                // Para nodos interiores, obtén la clave de la celda que será promovida
+                match self.node_type {
+                    PageType::TableInterior => {
+                        let (mid_left_child_page, mid_key) = match &orig_page.cells[(split_point - 1) as usize] {
+                            BTreeCell::TableInterior(cell) => (cell.left_child_page, cell.key),
+                            _ => unreachable!("Incorrect cell type"),
+                        };
+                        
+                        // Actualizar el right-most child de la página original
+                        orig_page.header.right_most_page = Some(mid_left_child_page);
+                        (mid_key, split_point - 1)
+                    },
+                    PageType::IndexInterior => {
+                        // Obtener datos para nodos de índice interior
+                        let (mid_payload, mid_left_child_page) = match &orig_page.cells[(split_point - 1) as usize] {
+                            BTreeCell::IndexInterior(cell) => (cell.payload.clone(), cell.left_child_page),
+                            _ => unreachable!("Incorrect cell type"),
+                        };
+                        
+                        // Actualizar el right-most child
+                        orig_page.header.right_most_page = Some(mid_left_child_page);
+                        
+                        // Extraer clave del payload
+                        let key_value = extract_key_from_payload(&mid_payload)?;
+                        let key = match key_value {
+                            KeyValue::Integer(i) => i,
+                            KeyValue::Float(f) => f as i64,
+                            _ => {
+                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                std::hash::Hash::hash(&key_value, &mut hasher);
+                                hasher.finish() as i64
+                            }
+                        };
+                        (key, split_point - 1)
+                    },
+                    _ => unreachable!("Not an interior node"),
+                }
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Interior node without right-most child pointer",
+                ));
             }
         } else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Interior node without right-most child pointer",
-            ));
+            // Para nodos hoja, la clave mediana es el rowid de la primera celda en el nuevo nodo
+            if cells.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "No cells to move to new node",
+                ));
+            }
+            
+            match self.node_type {
+                PageType::TableLeaf => {
+                    match &cells[0] {
+                        BTreeCell::TableLeaf(cell) => (cell.row_id, 0),
+                        _ => unreachable!("Incorrect cell type"),
+                    }
+                },
+                PageType::IndexLeaf => {
+                    match &cells[0] {
+                        BTreeCell::IndexLeaf(cell) => {
+                            let key_value = extract_key_from_payload(&cell.payload)?;
+                            match key_value {
+                                KeyValue::Integer(i) => (i, 0),
+                                KeyValue::Float(f) => (f as i64, 0),
+                                _ => {
+                                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                    std::hash::Hash::hash(&key_value, &mut hasher);
+                                    (hasher.finish() as i64, 0)
+                                }
+                            }
+                        },
+                        _ => unreachable!("Incorrect cell type"),
+                    }
+                },
+                _ => unreachable!("Not a leaf node"),
+            }
+        };
+        
+        // Actualizar el content start offset
+        orig_page.update_content_start_offset();
+        
+        (cells, indices, right_most, median)
+    };
+    
+    // Luego, actualizar la nueva página
+    {
+        let mut new_page = new_node.get_page_mut()?;
+        
+        // Si es un nodo interior, establecer el right-most page
+        if self.node_type.is_interior() {
+            new_page.header.right_most_page = orig_right_most_page;
         }
-    } else {
-        // For leaf nodes, we need the key of the first cell in the new node
-        // Add all cells to the new page first
+        
+        // Agregar las celdas y los índices a la nueva página
         for cell in cells_to_move {
             new_page.cells.push(cell);
         }
         
-        // Add all indices to the new page
         for idx in indices_to_move {
             new_page.cell_indices.push(idx);
         }
         
-        // The median key is the rowid of the first cell in the new node
-        match self.node_type {
-            PageType::TableLeaf => {
-                let first_cell = &new_page.cells[0];
-                match first_cell {
-                    BTreeCell::TableLeaf(cell) => (cell.row_id, 0),
-                    _ => unreachable!("Incorrect cell type"),
-                }
-            },
-            PageType::IndexLeaf => {
-                let first_cell = &new_page.cells[0];
-                match first_cell {
-                    BTreeCell::IndexLeaf(cell) => {
-                        let key_value = extract_key_from_payload(&cell.payload)?;
-                        match key_value {
-                            KeyValue::Integer(i) => (i, 0),
-                            KeyValue::Float(f) => (f as i64, 0),  // Convert float to int for API compatibility
-                            _ => {
-                                // For string and blob, hash the key for API compatibility
-                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                std::hash::Hash::hash(&key_value, &mut hasher);
-                                (hasher.finish() as i64, 0)
-                            }
-                        }
-                    },
-                    _ => unreachable!("Incorrect cell type"),
-                }
-            },
-            _ => unreachable!("Not a leaf node"),
-        }
-    };
+        // Actualizar el conteo de celdas
+        new_page.header.cell_count = new_page.cells.len() as u16;
+        
+        // Actualizar el content start offset
+        new_page.update_content_start_offset();
+    }
     
-    // Update the content start offset for both pages
-    orig_page.update_content_start_offset();
-    new_page.update_content_start_offset();
-    drop(orig_page);
-    drop(new_page);
-
     Ok((new_node, median_key.0, median_key.1))
 }
-
 /// Inserts a cell into the node in the correct position based on the key.
 ///
 /// # Parameters
