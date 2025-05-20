@@ -222,7 +222,7 @@ where
     /// A mutable reference to the page.
     pub fn get_page_mut<F, R>(&self, page_number: u32, page_type: Option<PageType>, f: F) -> io::Result<R>
 where
-    F: FnOnce(&Page) -> R,
+    F: FnOnce(&mut Page) -> R,
 {
     let mut page_cache = self.page_cache.try_borrow_mut().map_err(
         |_| io::Error::new(
@@ -254,7 +254,7 @@ where
             io::ErrorKind::NotFound,
             format!("Page {} not found in cache", page_number),
         )
-    })?;
+    })?;<<<<<<<<<<
     
     // Ejecutar la función callback con la referencia a la página
     Ok(f(page))

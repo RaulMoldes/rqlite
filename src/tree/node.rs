@@ -12,7 +12,7 @@ use std::hash::Hasher;
 use std::io;
 use std::io::Cursor;
 use std::rc::Rc;
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex};
 
 //use super::btree;
 
@@ -61,11 +61,11 @@ pub struct BTreeNode {
     /// Type of the node (interior or leaf).
     pub node_type: PageType,
     /// Mutable reference to the pager for I/O operations.
-    /// Opted to use `Rc<RwLock<Pager>>` because each node needs a mutable reference to the pager,
+    /// Opted to use `Arc<Mutex<Pager>>` because each node needs a mutable reference to the pager,
     /// However, there is going to be only one pager in the whole B-Tree, and there will be only one writer at a time.
     /// This allows us to share the pager across multiple nodes while still allowing for mutable access.
     
-    pager: Rc<RwLock<Pager>>, // Decided to switch to Rc<RwLock<Pager>> for thread safety and interior mutability. 
+    pager: Arc<Mutex<Pager>>, // Decided to switch to Arc<Mutex<Pager>> for thread safety and interior mutability. 
     // In SQLite, there is a limit of one writer at a time, so this is not a problem.
     // If we wanted to have multiple writers, we would need to use a more complex synchronization mechanism, maybe using `Mutex` or `RwLock`.
     // An issue is that we currently require a mutable reference to the pager just to read the page, which is not ideal.
@@ -80,11 +80,11 @@ impl BTreeNode {
     /// * `pager` - Reference to the pager for I/O operations.
     ///
     /// # Before, I was going to use a raw pointer for the pager, so the pager needed to be alive for the whole life of the node, but now with Rc and RefCell is not needed..
-    pub fn new(page_number: u32, node_type: PageType, shared_pager: Rc<RwLock<Pager>>) -> Self {
+    pub fn new(page_number: u32, node_type: PageType, shared_pager: Arc<Mutex<Pager>>) -> Self {
         BTreeNode {
             page_number,
             node_type,
-            pager: Rc::clone(&shared_pager),
+            pager: AArc::clone(&shared_pager),
         }
     }
 
@@ -100,41 +100,35 @@ impl BTreeNode {
     pub fn open(
         page_number: u32,
         node_type: PageType,
-        shared_pager: Rc<RwLock<Pager>>,
+        shared_pager: Arc<Mutex<Pager>>,
     ) -> io::Result<Self> {
         // Verify that the page exists and is of the correct type
             
-            let mut pager_ref = shared_pager.write().map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+            let pager_ref = shared_pager.lock().map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
                 })?;
-            let page = pager_ref.get_page(page_number, Some(node_type))?;
-            
-            match page {
-                Page::BTree(btree_page) => {
-                    if btree_page.header.page_type != node_type {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "Tipo de página incorrecto: esperado {:?}, obtenido {:?}",
+            pager_ref.get_page(page_number, Some(node_type), |page|{
+                // Check if the page is of the correct type
+                match page {
+                    Page::BTree(btree_page) => {
+                        if btree_page.header.page_type != node_type {
+                            panic!(
+                                "Unexpected page type: expected {:?}, obtained {:?}",
                                 node_type, btree_page.header.page_type
-                            ),
-                        ));
+                            );
+                        }
                     }
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "La página no es de tipo BTree",
-                    ));
-                }
-            }
-    
+                    _ => panic!("Expected BTree page"),
+                };
+                
+            });
+            
 
         // Creates a new BTreeNode with the given page number and type
         Ok(BTreeNode {
             page_number,
             node_type,
-            pager: Rc::clone(&shared_pager),
+            pager: AArc::clone(&shared_pager),
         })
     }
 
@@ -143,18 +137,102 @@ impl BTreeNode {
     /// # Errors
     /// Returns an error if there are I/O issues or if the page is not of BTree type.
     pub fn cell_count(&self) -> io::Result<u16> {
-        let mut pager_ref = self.pager.write().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+        let pager_ref = self.pager.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
         })?;
-        let page = pager_ref.get_page(self.page_number, Some(self.node_type))?;
-        match page {
-            Page::BTree(btree_page) => Ok(btree_page.header.cell_count),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "The page is not of BTree type",
-            )),
+        
+        pager_ref.get_page(self.page_number, Some(self.node_type), |page| {
+            match page {
+                Page::BTree(btree_page) => btree_page.header.cell_count,
+                _ => panic!("Expected BTree page"),
+            }
+        })
+    }
+
+
+        /// Gets the free space in the node.
+    ///
+    /// # Errors
+    /// Returns an error if there are I/O issues.
+    pub fn free_space(&self) -> io::Result<usize> {
+        let pager_ref = self.pager.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
+        })?;
+        
+        pager_ref.get_page(self.page_number, Some(self.node_type), |page| {
+            match page {
+                Page::BTree(btree_page) => btree_page.free_space(),
+                _ => panic!("Expected BTree page"),
+            }
+        })
+    }
+
+    
+    /// Obtains the right-most child of the node (only for interior nodes).
+    ///
+    /// # Errors
+    /// Returns an error if the node is not an interior node or if there are I/O issues.
+    ///
+    /// # Returns
+    /// The page number of the right-most child.
+    pub fn get_right_most_child(&self) -> io::Result<u32> {
+        if !self.node_type.is_interior() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The node is not interior type.",
+            ));
         }
-      
+
+        let pager_ref = self.pager.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
+        })?;
+
+        pager_ref.get_page(self.page_number, Some(self.node_type), |page| {
+            match page {
+                Page::BTree(btree_page) => {
+                    match btree_page.header.right_most_page {
+                        Some(page_number) => page_number,
+                        None => panic!("Right-most child not found"),
+                    }
+                },
+                _ => panic!("Expected BTree page"),
+            }
+        })
+    }
+
+    /// Sets the right-most child of the node (only for interior nodes).
+    ///
+    /// # Parameters
+    /// * `page_number` - Page number of the right-most child.
+    ///
+    /// # Errors
+    /// Returns an error if the node is not an interior node or if there are I/O issues.
+    pub fn set_right_most_child(&self, page_number: u32) -> io::Result<()> {
+        if !self.node_type.is_interior() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The node is not interior type.",
+            ));
+        }
+
+        let pager_ref = self.pager.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
+        })?;
+
+        pager_ref.get_page_mut(self.page_number, Some(self.node_type), |page| {
+            match page {
+                Page::BTree(btree_page) => {
+                    btree_page.header.right_most_page = Some(page_number);
+                    Ok(())
+                },
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData, 
+                    "Page is not of BTree type"
+                )),
+            }
+        
+        });
+    Ok(())
     }
 
  
@@ -169,7 +247,7 @@ impl BTreeNode {
     ///
     /// # Errors
     /// Returns an error if the page cannot be created or if the type is not leaf.
-    pub fn create_leaf(node_type: PageType, pager: Rc<RwLock<Pager>>) -> io::Result<Self> {
+    pub fn create_leaf(node_type: PageType, pager: Arc<Mutex<Pager>>) -> io::Result<Self> {
         if !node_type.is_leaf() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -182,14 +260,14 @@ impl BTreeNode {
         let mut new_node = BTreeNode {
             page_number: 0,
             node_type,
-            pager: Rc::clone(&pager),
+            pager: Arc::clone(&pager),
         };
 
         let page_number = {
             new_node
                 .pager
-                .write().map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+                .lock().map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
                 })?
                 .create_btree_page(node_type, None)?
         };
@@ -209,7 +287,7 @@ impl BTreeNode {
     pub fn create_interior(
         node_type: PageType,
         right_most_page: Option<u32>, // Decided to make this optional because it aids flexibility.
-        pager: Rc<RwLock<Pager>>,
+        pager: Arc<Mutex<Pager>>,
     ) -> io::Result<Self> {
         if !node_type.is_interior() {
             return Err(io::Error::new(
@@ -221,7 +299,7 @@ impl BTreeNode {
         let mut new_node = BTreeNode {
             page_number: 0,
             node_type,
-            pager: Rc::clone(&pager),
+            pager: Arc::clone(&pager),
         };
 
         let mut right_most_page = right_most_page;
@@ -233,8 +311,8 @@ impl BTreeNode {
         let page_number = {
             new_node
                 .pager
-                .write().map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+                .lock().map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
                 })?
                 .create_btree_page(node_type, right_most_page)?
         };
@@ -274,8 +352,8 @@ impl BTreeNode {
                 ));
             }
         }
-        let mut pager_ref = self.pager.write().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+        let mut pager_ref = self.pager.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
         })?;
         
         let page = match pager_ref.get_page_mut(self.page_number, Some(self.node_type))? {
@@ -305,8 +383,8 @@ impl BTreeNode {
             ));
         }
 
-        let mut pager_ref = self.pager.write().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+        let mut pager_ref = self.pager.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
         })?;
         
         let page = match pager_ref.get_page(self.page_number, Some(self.node_type))? {
@@ -339,8 +417,8 @@ impl BTreeNode {
             ));
         }
 
-        let mut pager_ref = self.pager.write().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+        let mut pager_ref = self.pager.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
         })?;
         
         let page = match pager_ref.get_page_mut(self.page_number, Some(self.node_type))? {
@@ -358,8 +436,8 @@ impl BTreeNode {
     /// # Errors
     /// Returns an error if there are I/O issues.
     pub fn free_space(&self) -> io::Result<usize> {
-        let mut pager_ref = self.pager.write().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+        let mut pager_ref = self.pager.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
         })?;
         
         let page = match pager_ref.get_page(self.page_number, Some(self.node_type))? {
@@ -389,8 +467,8 @@ impl BTreeNode {
             ));
         }
 
-        let mut pager_ref = self.pager.write().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+        let mut pager_ref = self.pager.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
         })?;
         
         let page = match pager_ref.get_page(self.page_number, Some(self.node_type))? {
@@ -461,8 +539,8 @@ impl BTreeNode {
             ));
         }
 
-        let mut pager_ref = self.pager.write().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+        let mut pager_ref = self.pager.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
         })?;
         
         let page = match pager_ref.get_page(self.page_number, Some(self.node_type))? {
@@ -568,8 +646,8 @@ impl BTreeNode {
             ));
         }
 
-        let mut pager_ref = self.pager.write().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+        let mut pager_ref = self.pager.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
         })?;
         
         let page = match pager_ref.get_page(self.page_number, Some(self.node_type))? {
@@ -627,8 +705,8 @@ impl BTreeNode {
     /// - Index of the median cell
     pub fn split(&self) -> io::Result<(BTreeNode, i64, u16)> {
         let cell_count = {
-            let mut pager_ref = self.pager.write().map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+            let mut pager_ref = self.pager.lock().map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
             })?;
             
             let page = match pager_ref.get_page(self.page_number, Some(self.node_type))? {
@@ -643,13 +721,13 @@ impl BTreeNode {
 
         // Create a new node of the same type
         let new_node = match self.node_type {
-            PageType::TableLeaf => BTreeNode::create_leaf(self.node_type, Rc::clone(&self.pager))?,
+            PageType::TableLeaf => BTreeNode::create_leaf(self.node_type, Arc::clone(&self.pager))?,
             PageType::TableInterior => {
-                BTreeNode::create_interior(self.node_type, None, Rc::clone(&self.pager))?
+                BTreeNode::create_interior(self.node_type, None, Arc::clone(&self.pager))?
             }
-            PageType::IndexLeaf => BTreeNode::create_leaf(self.node_type, Rc::clone(&self.pager))?,
+            PageType::IndexLeaf => BTreeNode::create_leaf(self.node_type, Arc::clone(&self.pager))?,
             PageType::IndexInterior => {
-                BTreeNode::create_interior(self.node_type, None, Rc::clone(&self.pager))?
+                BTreeNode::create_interior(self.node_type, None, Arc::clone(&self.pager))?
             }
             _ => {
                 return Err(io::Error::new(
@@ -663,8 +741,8 @@ impl BTreeNode {
 
         // Primero, obtener datos de la página original
         let (cells_to_move, indices_to_move, orig_right_most_page, median_key) = {
-            let mut pager_ref = self.pager.write().map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+            let mut pager_ref = self.pager.lock().map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
             })?;
 
             let orig_page = match pager_ref.get_page_mut(self.page_number, Some(self.node_type))? {
@@ -782,8 +860,8 @@ impl BTreeNode {
 
         // Luego, actualizar la nueva página
         {   
-            let mut new_pager = new_node.pager.write().map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+            let mut new_pager = new_node.pager.lock().map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
             })?;
 
             let new_page = match new_pager.get_page_mut(new_node.page_number, Some(new_node.node_type))? {
@@ -856,8 +934,8 @@ impl BTreeNode {
         println!("Cell index size: {}", cell_index_size);
         // Check if the node has enough space for the new cell
         let free_space = {
-            let mut pager_ref = self.pager.write().map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+            let mut pager_ref = self.pager.lock().map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
             })?;
             let page = match pager_ref.get_page(self.page_number, Some(self.node_type))? {
                 Page::BTree(page) => page,
@@ -940,8 +1018,8 @@ impl BTreeNode {
                 println!("Índice encontrado: {}", idx);
                 if found {
                     // Replace existing cell with the same rowid
-                    let mut pager = self.pager.write().map_err(|e| {
-                        io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+                    let mut pager = self.pager.lock().map_err(|e| {
+                        io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
                     })?;
                     let page = match pager.get_page_mut(self.page_number, Some(self.node_type))? {
                         Page::BTree(page) => page,
@@ -956,8 +1034,8 @@ impl BTreeNode {
             }
             (PageType::TableInterior, BTreeCell::TableInterior(table_cell)) => {
                 // Find position based on key for table interior nodes
-                let mut pager = self.pager.write().map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+                let mut pager = self.pager.lock().map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
                 })?;
                 let page = match pager.get_page(self.page_number, Some(self.node_type))? {
                     Page::BTree(page) => page,
@@ -983,8 +1061,8 @@ impl BTreeNode {
 
                         if mid_key == table_cell.key {
                             // Replace cell with same key
-                            let mut pager = self.pager.write().map_err(|e| {
-                                io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+                            let mut pager = self.pager.lock().map_err(|e| {
+                                io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
                             })?;
                             let page = match pager.get_page_mut(self.page_number, Some(self.node_type))? {
                                 Page::BTree(page) => page,
@@ -1010,8 +1088,8 @@ impl BTreeNode {
 
                 if found {
                     // Replace existing cell with the same key
-                    let mut pager = self.pager.write().map_err(|e| {
-                        io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+                    let mut pager = self.pager.lock().map_err(|e| {
+                        io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
                     })?;
                     let page = match pager.get_page_mut(self.page_number, Some(self.node_type))? {
                         Page::BTree(page) => page,
@@ -1030,8 +1108,8 @@ impl BTreeNode {
 
                 if found {
                     // Replace existing cell with the same key
-                    let mut pager = self.pager.write().map_err(|e| {
-                        io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+                    let mut pager = self.pager.lock().map_err(|e| {
+                        io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
                     })?;
                     let page = match pager.get_page_mut(self.page_number, Some(self.node_type))? {
                         Page::BTree(page) => page,
@@ -1047,8 +1125,8 @@ impl BTreeNode {
         };
 
         // Insert the cell at the calculated position
-        let mut pager = self.pager.write().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("RwLock poisoned: {}", e))
+        let mut pager = self.pager.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
         })?;
         let page = match pager.get_page_mut(self.page_number, Some(self.node_type))? {
             Page::BTree(page) => page,
