@@ -1087,7 +1087,14 @@ impl Page {
             Page::Free(page) => page.page_number,
         }
     }
-
+    /// Returns the page type.
+    pub fn page_type(&self) -> PageType {
+        match self {
+            Page::BTree(page) => page.header.page_type,
+            Page::Overflow(_) => PageType::Overflow,
+            Page::Free(_) => PageType::Free,
+        }
+    }
     /// Returns tha page size.
     pub fn page_size(&self) -> u32 {
         match self {

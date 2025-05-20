@@ -1,8 +1,8 @@
 // src/storage/buffer_pool.rs
 
-use crate::page::Page;
+use crate::page::{PageType,Page};
 use std::collections::{HashMap, VecDeque};
-
+use std::cell::RefCell;
 /// Represents a frame in the buffer pool that holds a page.
 /// The frame contains metadata about the page, such as pin count and dirty flag.
 pub struct BufferFrame {
@@ -67,6 +67,11 @@ impl BufferFrame {
     pub fn page_mut(&mut self) -> &mut Page {
         &mut self.page
     }
+
+    pub fn page_ref_cell(&self) -> RefCell<&Page> {
+        RefCell::new(&self.page)
+    }
+
 }
 
 /// A buffer pool that caches pages in memory using a LRU (Least Recently Used) eviction policy.
@@ -107,6 +112,24 @@ impl BufferPool {
         self.frames.contains_key(&page_number)
     }
 
+    pub fn validate_page_type(
+        &self,
+        page_number: u32,
+        page_type: PageType,
+    ) -> Result<(), String> {
+        if let Some(frame) = self.frames.get(&page_number) {
+            if frame.page().page_type() != page_type {
+                return Err(format!(
+                    "Page type mismatch for page {}: expected {:?}, found {:?}",
+                    page_number,
+                    page_type,
+                    frame.page().page_type()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Gets a reference to a page from the buffer pool
     ///
     /// # Parameters
@@ -128,6 +151,8 @@ impl BufferPool {
 
         None
     }
+
+  
 
     /// Gets a mutable reference to a page from the buffer pool
     ///
