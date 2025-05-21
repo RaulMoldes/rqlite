@@ -254,7 +254,7 @@ where
             io::ErrorKind::NotFound,
             format!("Page {} not found in cache", page_number),
         )
-    })?;<<<<<<<<<<
+    })?;
     
     // Ejecutar la función callback con la referencia a la página
     Ok(f(page))
