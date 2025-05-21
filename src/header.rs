@@ -328,7 +328,7 @@ impl fmt::Display for Header {
 /// # Safety
 /// This function is safe to call as long as the size is valid.
 fn is_valid_page_size(size: u32) -> bool {
-    if size < 512 || size > 65536 {
+    if !(512..=65536).contains(&size) {
         return false;
     }
 

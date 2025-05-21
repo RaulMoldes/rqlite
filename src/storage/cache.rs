@@ -338,7 +338,7 @@ impl BufferPool {
                 if frame.is_pinned() {
                     // Push the page to the back of the LRU list
                     self.lru_list.push_back(page_number);
-
+                    println!("Page {} is pinned, skipping eviction\n", page_number);
                     continue;
                 }
 
