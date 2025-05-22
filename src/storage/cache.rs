@@ -112,6 +112,20 @@ impl BufferPool {
         self.frames.contains_key(&page_number)
     }
 
+    // Updates the page content in the buffer pool
+    pub fn update_page(
+        &mut self,
+        page_number: u32,
+        page: Page,
+    ) -> Result<(), String> {
+        if let Some(frame) = self.frames.get_mut(&page_number) {
+            frame.page = page;
+            Ok(())
+        } else {
+            Err(format!("Page {} not found in buffer pool", page_number))
+        }
+    }
+
     pub fn validate_page_type(
         &self,
         page_number: u32,

@@ -4,14 +4,15 @@
 //! the loading and caching of database pages. It interacts with the `DiskManager`
 
 
+use core::panic;
 use std::io::{self, Write};
 use std::path::Path;
 
 use super::cache::BufferPool;
 use super::disk::{self, DiskManager};
 use crate::header::Header;
-use crate::page::{
-    self, BTreeCell, BTreePage, BTreePageHeader, ByteSerializable, FreePage, IndexInteriorCell, IndexLeafCell, OverflowPage, Page, PageType, TableInteriorCell, TableLeafCell
+use crate::page::{Page,
+    self, BTreeCell, BTreePage, BTreePageHeader, ByteSerializable, FreePage, IndexInteriorCell, IndexLeafCell, OverflowPage, PageType, TableInteriorCell, TableLeafCell
 };
 
 use std::cell::{Ref, RefCell, RefMut};
@@ -33,6 +34,8 @@ pub struct Pager {
     /// Size of each page in bytes.
     /// This is the size of the page that is going to be used in the database.
     page_size: u32,
+
+    journal_pages: Vec<(u32,Page)>,
     /// Reserved space at the end of each page.
     reserved_space: u8,
     /// Indicates if the pager has unsaved changes. That must be written to disk.
@@ -43,10 +46,15 @@ pub struct Pager {
 
 impl Drop for Pager {
     fn drop(&mut self) {
-        // Flush the dirty pages to disk when the pager is dropped
-        if let Err(e) = self.flush() {
-            eprintln!("Error flushing pager: {}", e);
+
+       // If we are in the middle of a transaction, we need to rollback
+        if self.dirty {
+            // Rollback the transaction
+            if let Err(e) = self.rollback_transaction() {
+                eprintln!("Error rolling back transaction: {}", e);
+            }
         }
+       
     }
 }
 
@@ -69,6 +77,7 @@ impl Pager {
         Ok(Pager {
             disk_manager,
             page_cache: BufferPool::new(buffer_pool_size.unwrap_or(1000)),
+            journal_pages: vec![],
             page_size: header.page_size,
             reserved_space: header.reserved_space,
             dirty: false,
@@ -104,6 +113,7 @@ impl Pager {
             disk_manager,
             page_cache: BufferPool::new(buffer_pool_size.unwrap_or(1000)),
             page_size,
+            journal_pages: vec![],  // For now the journal is kept on memory
             reserved_space,
             dirty: false,
         })
@@ -184,6 +194,58 @@ impl Pager {
         Ok(page)
     }
 
+    fn begin_transaction(&mut self) -> io::Result<()> {
+        // This is a no-op for now, but we could do some initialization here if needed
+        // We are going to use the journal pages to keep track of the dirty pages
+        self.journal_pages.clear();
+        self.dirty = true; // We are dirty now
+        Ok(())
+    }
+
+
+    pub fn commit_transaction(&mut self) -> io::Result<()> {
+        // Flush the dirty pages to disk
+        // Kind of a two-phase commit, but not really
+        if  self.flush().is_ok() {
+            self.clear_journal();  
+            Ok(()) 
+
+        } else {
+            // Rollback the transaction if there was an error
+            self.rollback_transaction()?;
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Transaction failed",
+            ))
+        }
+
+        
+    }
+
+    fn clear_journal(&mut self) {
+        // Clear the journal pages
+        if self.dirty {
+            panic!("Cannot clear journal pages, we are in the middle of a transaction");
+        }
+        self.journal_pages.clear();
+    }
+
+    fn rollback_transaction(&mut self) -> io::Result<()> {
+        // Rolling back is just a matter of removing the pages from the journal and rewriting them back to disk.
+        for (page_number, page) in self.journal_pages.iter() {
+            // Write the page to disk
+            let buffer = self.serialize_page(page)?;
+            self.disk_manager.write_page(*page_number, &buffer)?;
+        }
+        // The transaction was invalidated, so we need to clear the journal
+        self.page_cache.mark_clean_all(); // Mark all pages as clean
+        self.dirty = false; // We are not dirty anymore
+        self.clear_journal(); // Clear the journal pages
+        Ok(())
+    }
+
+
+
 
 
     /// Similar to `get_page`, but returns a mutable reference to the page.
@@ -226,8 +288,12 @@ impl Pager {
                 format!("Page {} not found in cache", page_number),
             )
         })?;
+
+        // Loading the page mutably implies adding it to the journal list
+        self.journal_pages.push((page_number, page.clone()));
         
-       
+       // This actually marks the initiation of a transaction
+        self.dirty = true; // We are dirty now
         Ok(page)
     }
 
@@ -278,7 +344,7 @@ impl Pager {
         if let Some((evicted_page_number, evicted_page)) = self.add_page_to_cache(page_number, page)?{
            
             let buffer = self.serialize_page(&evicted_page)?;
-            // Write the page to disk
+            // Write the page to disk. This should be safe because the buffer pool wont evict a page that is marked as dirty.
             self.disk_manager.write_page(evicted_page_number, &buffer)?;
             
         }
@@ -463,7 +529,7 @@ impl Pager {
     ///
     /// # Returns
     /// Number of the created page.
-    fn create_btree_page(
+    pub fn create_btree_page(
         &mut self,
         page_type: PageType,
         right_most_page: Option<u32>,
@@ -496,7 +562,7 @@ impl Pager {
     ///
     /// # Errors
     /// Returns an error if the page cannot be created or if the data is too large.
-    fn create_overflow_page(&mut self, next_page: u32, 
+    pub fn create_overflow_page(&mut self, next_page: u32, 
         data: Vec<u8>,
     ) -> io::Result<u32> {
         // Verify the size of the data
@@ -535,7 +601,7 @@ impl Pager {
     ///
     /// # Returns
     /// Number of the created page.
-    fn create_free_page(&mut self, 
+    pub fn create_free_page(&mut self, 
         next_page: u32,
     ) -> io::Result<u32> {
         // Add a new page
@@ -613,8 +679,4 @@ impl Pager {
       
     }
 
-    /// Closes the pager and flushes any dirty pages to disk.
-    pub fn close(&mut self) -> io::Result<()> {
-        self.flush()
-    }
 }
