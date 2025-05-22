@@ -194,11 +194,22 @@ impl Pager {
         Ok(page)
     }
 
-    fn begin_transaction(&mut self) -> io::Result<()> {
+    pub fn begin_transaction(&mut self) -> io::Result<()> {
         // This is a no-op for now, but we could do some initialization here if needed
         // We are going to use the journal pages to keep track of the dirty pages
         self.journal_pages.clear();
         self.dirty = true; // We are dirty now
+        Ok(())
+    }
+
+    pub fn unpin_page(&mut self, page_number: u32) -> io::Result<()> {
+        // Unpin the page from the cache
+        if !self.page_cache.unpin_page(page_number) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Page {} not found in cache", page_number),
+            ));
+        }
         Ok(())
     }
 
