@@ -276,28 +276,23 @@ impl BufferPool {
         false
     }
 
-    /// Gets a list of all dirty pages in the buffer pool
-    ///
-    /// # Returns
-    /// Vector of page numbers for dirty pages
-    pub fn get_dirty_pages(&self) -> Vec<u32> {
-        self.frames
-            .iter()
-            .filter(|(_, frame)| frame.is_dirty())
-            .map(|(page_number, _)| *page_number)
-            .collect()
-    }
 
     /// Gets a list of all dirty pages in the buffer pool
     ///
     /// # Returns
     /// Vector of page refrences for dirty pages
-    pub fn get_dirty_pages_referenced(&self) -> Vec<(u32, &Page)> {
+    pub fn get_dirty_pages(&self) -> Vec<(u32, &Page)> {
         self.frames
             .iter()
             .filter(|(_, frame)| frame.is_dirty())
             .map(|(page_number, frame)| (*page_number, &frame.page))
             .collect()
+    }
+
+    pub fn mark_clean_all(&mut self) {
+        for frame in self.frames.values_mut() {
+            frame.reset_dirty();
+        }
     }
 
     /// Removes a page from the buffer pool
@@ -571,8 +566,9 @@ mod tests {
         // Get dirty pages
         let dirty_pages = pool.get_dirty_pages();
         assert_eq!(dirty_pages.len(), 2);
-        assert!(dirty_pages.contains(&1));
-        assert!(dirty_pages.contains(&3));
+        
+        assert!(dirty_pages.iter().any(|(num, _)| *num == 1));
+        assert!(dirty_pages.iter().any(|(num, _)| *num == 3));
     }
 
     #[test]

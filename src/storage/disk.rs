@@ -167,6 +167,8 @@ impl DiskManager {
         // The offset is calculated as (page_number - 1) * page_size
         // This is a common way to calculate the offset for fixed-size pages in a file. As all pages are the same size, we can use this formula.
         let offset = self.page_offset(page_number);
+        println!("Reading page {} at offset {}", page_number, offset);
+      
         self.file.seek(SeekFrom::Start(offset))?;
 
         if buffer.len() != self.page_size as usize {
