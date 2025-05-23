@@ -1,10 +1,12 @@
 // Additional improvements to your BufferPool implementation
 
 use crate::page::{PageType, Page};
+use core::panic;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 
 /// Enhanced BufferFrame with better tracking
+#[derive(Debug)]
 pub struct BufferFrame {
     page: Page,
     pin_count: u32,
@@ -27,6 +29,7 @@ impl BufferFrame {
     }
 
     pub fn pin(&mut self) {
+       
         self.pin_count += 1;
         self.last_accessed = std::time::Instant::now();
     }
@@ -82,6 +85,7 @@ impl BufferFrame {
 }
 
 /// Enhanced BufferPool with better page lifecycle management
+
 pub struct BufferPool {
     max_pages: usize,
     frames: HashMap<u32, BufferFrame>,
@@ -187,8 +191,9 @@ impl BufferPool {
         if let Some(frame) = self.frames.get_mut(&page_number) {
             let was_pinned = frame.is_pinned();
             let is_now_unpinned = frame.unpin();
-            
+            // println!("Unpinning page {}", page_number);
             if was_pinned {
+              
                 self.stats.unpin_operations += 1;
             }
 
@@ -224,15 +229,24 @@ impl BufferPool {
     /// Enhanced add_page with better eviction logic
     pub fn add_page(&mut self, page_number: u32, page: Page, pin: bool) -> Option<(u32, Page)> {
         // Check if we need to evict a page
+        
         let evicted = if self.frames.len() >= self.max_pages && !self.frames.contains_key(&page_number) {
             self.evict_page_smart()
+            //self.evict_page_original()
         } else {
             None
         };
 
+        // println!("Evicted page: {:?}", evicted);
+        if page_number == 4 {
+            panic!("Page number 4 is not allowed");
+        }
+       
+
         if evicted.is_none() && self.frames.len() >= self.max_pages && !self.frames.contains_key(&page_number) {
             // If we couldn't evict a page, return the requested page (rejected)
             return Some((page_number, page));
+            
         }
 
         // Create a new frame for this page
@@ -249,27 +263,30 @@ impl BufferPool {
 
         // Add the frame to the buffer pool
         self.frames.insert(page_number, frame);
-
+        // println!("Added page {} to buffer pool", page_number);
         evicted
     }
 
     /// Smart eviction that considers page access patterns
     fn evict_page_smart(&mut self) -> Option<(u32, Page)> {
+        // println!("Evicting page using smart eviction strategy");
+        // println!("Frames before eviction: {:?}", self.frames);
         // First, try to find the least recently used unpinned page
         let mut candidates: Vec<_> = self.lru_list
             .iter()
             .filter_map(|&page_number| {
-                self.frames.get(&page_number).map(|frame| (page_number, frame.last_accessed()))
+                self.frames.get(&page_number).map(|frame| (page_number, frame.last_accessed(), frame.is_pinned()))
             })
-            .filter(|(page_number, _)| {
-                self.frames.get(page_number).map_or(false, |frame| !frame.is_pinned())
+            .filter(|(page_number, _,_)| {
+                self.frames.get(page_number).is_some_and(|frame| !frame.is_pinned())
             })
             .collect();
 
+        // println!("Candidates for eviction: {:?}", candidates);
         // Sort by last accessed time (oldest first)
-        candidates.sort_by_key(|(_, last_accessed)| *last_accessed);
+        candidates.sort_by_key(|(_, last_accessed,_)| *last_accessed);
 
-        if let Some((page_number, _)) = candidates.first() {
+        if let Some((page_number, _,_)) = candidates.first() {
             let page_number = *page_number;
             
             // Remove from LRU list
@@ -520,8 +537,13 @@ impl BufferPool {
 
     /// Pin a page for use with guards
     pub fn pin_page_for_guard(&mut self, page_number: u32) -> io::Result<()> {
+        
         if let Some(frame) = self.frames.get_mut(&page_number) {
+           
             frame.pin();
+            // println!("Pinning page {} for guard", page_number);
+            // println!("Page {} is now pinned. Pin count is {}", page_number, frame.pin_count());
+            // println!("Page {} is pinned: {}", page_number, frame.is_pinned());  
             self.stats.pin_operations += 1;
             Ok(())
         } else {

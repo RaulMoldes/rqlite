@@ -19,6 +19,7 @@
 //! |                                                      |
 //! |------------------------------------------------------|
 use crate::header::HEADER_SIZE;
+
 use std::fmt;
 use std::io::Cursor;
 use std::io::{self, Read, Write};
@@ -960,20 +961,22 @@ impl ByteSerializable for OverflowPage {
         reader.read_exact(&mut buffer)?;
 
         let next_page = u32::from_be_bytes(buffer);
-
+        println!("Next page: {}", next_page);
         // Read the page_size:
         let mut buffer = [0u8; 4];
         reader.read_exact(&mut buffer)?;
         let page_size = u32::from_be_bytes(buffer);
-
+        println!("Page size: {}", page_size);
         // Read the page_number:
         let mut buffer = [0u8; 4];
         reader.read_exact(&mut buffer)?;
         let page_number = u32::from_be_bytes(buffer);
-
+        println!("Page number: {}", page_number);
         // Read data
         let mut data = Vec::new();
         reader.read_to_end(&mut data)?;
+        println!("Data size: {}", data.len());
+      //  println!("Data: {:?}", data);
 
         // Create overflow page
         Ok(OverflowPage {
@@ -992,9 +995,15 @@ impl ByteSerializable for OverflowPage {
         writer.write_all(&self.page_size.to_be_bytes())?;
         // Write page number
         writer.write_all(&self.page_number.to_be_bytes())?;
-
+       // println!("Writing overflow page: {:?}", self.data);
+       
         // Write data
         writer.write_all(&self.data)?;
+        
+            println!("Overflow page data: {:?}", self.data);
+            
+        
+       
 
         Ok(())
     }

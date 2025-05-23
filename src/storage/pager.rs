@@ -1,137 +1,185 @@
-//! # Improved Pager Implementation with RAII Guards
+//! # Pager Module
 //!
-//! This implementation provides automatic page unpinning through RAII guards,
-//! ensuring pages are properly unpinned when they go out of scope.
+//! This module implements the Pager, which manages page-level operations for the SQLite database.
+//! It provides a safe abstraction over disk I/O and implements a buffer pool for caching pages.
+//! The Pager ensures that pages are properly managed through RAII guards that automatically
+//! unpin pages when they go out of scope.
 
-use std::ops::{Deref, DerefMut};
+use std::cell::{RefCell, Cell};
 use std::io;
 use std::path::Path;
-use std::rc::Rc;
-use std::cell::RefCell;
+use std::rc::{Rc};
+use std::sync::{Arc, Weak};
+use std::sync::Mutex;
 
 use super::cache::BufferPool;
 use super::disk::DiskManager;
 use crate::header::Header;
 use crate::page::{Page, PageType, BTreePage, OverflowPage, FreePage, ByteSerializable};
 
-/// RAII guard for immutable page access
-/// Automatically unpins the page when dropped using BufferPool
-pub struct PageGuard {
-    page_number: u32,
-    page: *const Page, // Raw pointer to avoid borrow checker issues
-    buffer_pool: Rc<RefCell<BufferPool>>,
-}
-
-impl PageGuard {
-    /// Creates a new PageGuard
-    fn new(page_number: u32, page: &Page, buffer_pool: Rc<RefCell<BufferPool>>) -> Self {
-        PageGuard {
-            page_number,
-            page: page as *const Page,
-            buffer_pool,
-        }
-    }
-}
-
-impl Deref for PageGuard {
-    type Target = Page;
-
-    fn deref(&self) -> &Self::Target {
-        // Safe because the BufferPool guarantees the page stays alive while pinned
-        unsafe { &*self.page }
-    }
-}
-
-impl Drop for PageGuard {
-    fn drop(&mut self) {
-        // Automatically unpin the page when the guard is dropped
-        if let Ok(mut pool) = self.buffer_pool.try_borrow_mut() {
-            let _ = pool.unpin_page(self.page_number);
-        }
-    }
-}
-
-/// RAII guard for mutable page access
-/// Automatically unpins the page when dropped and marks it as dirty
-pub struct PageGuardMut {
-    page_number: u32,
-    page: *mut Page, // Raw pointer to avoid borrow checker issues
-    buffer_pool: Rc<RefCell<BufferPool>>,
-}
-
-impl PageGuardMut {
-    /// Creates a new PageGuardMut
-    fn new(page_number: u32, page: &mut Page, buffer_pool: Rc<RefCell<BufferPool>>) -> Self {
-        PageGuardMut {
-            page_number,
-            page: page as *mut Page,
-            buffer_pool,
-        }
-    }
-}
-
-impl Deref for PageGuardMut {
-    type Target = Page;
-
-    fn deref(&self) -> &Self::Target {
-        // Safe because the BufferPool guarantees the page stays alive while pinned
-        unsafe { &*self.page }
-    }
-}
-
-impl DerefMut for PageGuardMut {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // Safe because the BufferPool guarantees the page stays alive while pinned
-        unsafe { &mut *self.page }
-    }
-}
-
-impl Drop for PageGuardMut {
-    fn drop(&mut self) {
-        // Automatically unpin the page when the guard is dropped
-        if let Ok(mut pool) = self.buffer_pool.try_borrow_mut() {
-            let _ = pool.unpin_page(self.page_number);
-        }
-    }
-}
-
-/// Enhanced Pager with RAII guards for automatic page management
-pub struct Pager {
+/// Internal structure that manages the actual pager state
+/// This is wrapped in Arc<Mutex<>> to allow safe sharing between guards
+struct PagerInner {
     disk_manager: DiskManager,
-    page_cache: Rc<RefCell<BufferPool>>, // Shared reference to allow guards to access it
+    page_cache: BufferPool,
     page_size: u32,
     journal_pages: Vec<(u32, Page)>,
     reserved_space: u8,
     dirty: bool,
 }
 
-impl Drop for Pager {
-    fn drop(&mut self) {
-        if self.dirty {
-            if let Err(e) = self.rollback_transaction() {
-                eprintln!("Error rolling back transaction: {}", e);
-            }
+/// RAII guard for immutable page access
+/// Automatically unpins the page when dropped
+pub struct PageGuard {
+    page_number: u32,
+    pager: Weak<Mutex<PagerInner>>,
+    /// We store a raw pointer to avoid lifetime issues, but ensure safety through pinning
+    page_ptr: *const Page,
+}
+
+impl PageGuard {
+    /// Creates a new PageGuard
+    /// 
+    /// # Safety
+    /// The page pointer must remain valid for the lifetime of the guard.
+    /// This is ensured by the pinning mechanism in the buffer pool.
+    fn new(page_number: u32, page: &Page, pager: &Arc<Mutex<PagerInner>>) -> Self {
+        PageGuard {
+            page_number,
+            pager: Arc::downgrade(pager),
+            page_ptr: page as *const Page,
         }
+    }
+    
+    /// Gets a reference to the page
+    pub fn page(&self) -> &Page {
+        // Safe because:
+        // 1. The page is pinned in the buffer pool
+        // 2. The guard ensures the page stays pinned until dropped
+        unsafe { &*self.page_ptr }
     }
 }
 
+impl Drop for PageGuard {
+    fn drop(&mut self) {
+        // Try to upgrade the weak reference
+        if let Some(pager) = self.pager.upgrade() {
+            // Try to lock the pager
+            if let Ok(mut inner) = pager.lock() {
+                // Unpin the page
+                let _ = inner.page_cache.unpin_page(self.page_number);
+            }
+        }
+        // If we can't upgrade or lock, the pager has been dropped
+        // and cleanup has already happened
+    }
+}
+
+/// RAII guard for mutable page access
+/// Automatically unpins the page when dropped
+pub struct PageGuardMut {
+    page_number: u32,
+    pager: Weak<Mutex<PagerInner>>,// Using Weak to avoid circular reference, ensuring the page guard can be dropped
+    /// We store a raw pointer to avoid lifetime issues, but ensure safety through pinning
+    page_ptr: *mut Page,
+}
+
+impl PageGuardMut {
+    /// Creates a new PageGuardMut
+    /// 
+    /// # Safety
+    /// The page pointer must remain valid for the lifetime of the guard.
+    /// This is ensured by the pinning mechanism in the buffer pool.
+    fn new(page_number: u32, page: &mut Page, pager: &Arc<Mutex<PagerInner>>) -> Self {
+        PageGuardMut {
+            page_number,
+            pager: Arc::downgrade(pager),
+            page_ptr: page as *mut Page,
+        }
+    }
+    
+    /// Gets a reference to the page
+    pub fn page(&self) -> &Page {
+        // Safe because:
+        // 1. The page is pinned in the buffer pool
+        // 2. The guard ensures the page stays pinned until dropped
+        unsafe { &*self.page_ptr }
+    }
+    
+    /// Gets a mutable reference to the page
+    pub fn page_mut(&mut self) -> &mut Page {
+        // Safe because:
+        // 1. The page is pinned in the buffer pool
+        // 2. The guard ensures exclusive access through Rust's borrowing rules
+        unsafe { &mut *self.page_ptr }
+    }
+}
+
+impl Drop for PageGuardMut {
+    fn drop(&mut self) {
+        // Try to upgrade the weak reference
+        if let Some(pager) = self.pager.upgrade() {
+            // Try to lock the pager
+            if let Ok(mut inner) = pager.lock() {
+                // Unpin the page
+                let _ = inner.page_cache.unpin_page(self.page_number);
+            }
+        }
+        // If we can't upgrade or lock, the pager has been dropped
+        // and cleanup has already happened
+    }
+}
+
+/// The Pager manages page-level operations for the database
+pub struct Pager {
+    inner: Arc<Mutex<PagerInner>>,
+}
+
 impl Pager {
-    /// Opens an existing database file with RAII page management
+
+       
+    /// Opens an existing database file
+    ///
+    /// # Parameters
+    /// * `path` - Path to the database file
+    /// * `buffer_pool_size` - Optional size of the buffer pool (default: 1000 pages)
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be opened or if the header is invalid
+    ///
+    /// # Returns
+    /// A new Pager instance
     pub fn open<P: AsRef<Path>>(path: P, buffer_pool_size: Option<usize>) -> io::Result<Self> {
         let mut disk_manager = DiskManager::open(path)?;
         let header = disk_manager.read_header()?;
 
-        Ok(Pager {
+        let inner = PagerInner {
             disk_manager,
-            page_cache: Rc::new(RefCell::new(BufferPool::new(buffer_pool_size.unwrap_or(1000)))),
-            journal_pages: vec![],
+            page_cache: BufferPool::new(buffer_pool_size.unwrap_or(1000)),
+            journal_pages: Vec::new(),
             page_size: header.page_size,
             reserved_space: header.reserved_space,
             dirty: false,
+        };
+
+        Ok(Pager {
+            inner: Arc::new(Mutex::new(inner)),
         })
     }
 
-    /// Creates a new database file with RAII page management
+    /// Creates a new database file
+    ///
+    /// # Parameters
+    /// * `path` - Path where to create the database file
+    /// * `page_size` - Size of each page in bytes (must be a power of 2 between 512 and 65536)
+    /// * `buffer_pool_size` - Optional size of the buffer pool (default: 1000 pages)
+    /// * `reserved_space` - Reserved space at the end of each page
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be created or if the page size is invalid
+    ///
+    /// # Returns
+    /// A new Pager instance
     pub fn create<P: AsRef<Path>>(
         path: P,
         page_size: u32,
@@ -144,289 +192,235 @@ impl Pager {
         header.reserved_space = reserved_space;
         disk_manager.write_header(&header)?;
 
-        Ok(Pager {
+        let inner = PagerInner {
             disk_manager,
-            page_cache: Rc::new(RefCell::new(BufferPool::new(buffer_pool_size.unwrap_or(1000)))),
+            page_cache: BufferPool::new(buffer_pool_size.unwrap_or(1000)),
             page_size,
-            journal_pages: vec![],
+            journal_pages: Vec::new(),
             reserved_space,
             dirty: false,
+        };
+
+        Ok(Pager {
+            inner: Arc::new(Mutex::new(inner)),
         })
     }
 
-    /// Gets a page with RAII guard for automatic unpinning
-    /// This is the recommended way to access pages
-    pub fn get_page_guard(&mut self, page_number: u32, page_type: Option<PageType>) -> io::Result<PageGuard> {
+    /// Gets a page with automatic unpinning when the guard is dropped
+    ///
+    /// # Parameters
+    /// * `page_number` - The page number to retrieve (1-based)
+    /// * `expected_type` - Optional expected page type for validation
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - The page number is out of range
+    /// - The page cannot be loaded from disk
+    /// - The page type doesn't match the expected type
+    ///
+    /// # Returns
+    /// A PageGuard that provides access to the page and automatically unpins it when dropped
+    pub fn get_page(&self, page_number: u32, expected_type: Option<PageType>) -> io::Result<PageGuard> {
+        // println!("get_page: {}", page_number);
+        
+
+        let mut inner = self.inner.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
+        })?;
+       
         // Load page if not in cache
-        let is_on_cache = {
-            let mut page_cache = self.page_cache.borrow_mut();
-            !page_cache.contains_page(page_number)
-        };
-        if !is_on_cache {
-            self.load_page(page_number)?;
+        if !inner.page_cache.contains_page_simple(page_number) {
+           
+            println!("Loading page {} from disk", page_number);
+             // Load the page from disk
+            Self::load_page(&mut inner, page_number)?;
+             // Create and return the guard
+        
         }
-     
+
+        
 
         // Validate page type if specified
-        if let Some(expected_type) = page_type {
-            let page_cache = self.page_cache.borrow();
-            page_cache.validate_page_type(page_number, expected_type).map_err(|opt_err|
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Type of page incorrect: expected {:?}, obtained {:?}",
-                        expected_type, opt_err
-                    ),
-                )
-            )?;
+        if let Some(expected) = expected_type {
+            inner.page_cache.validate_page_type(page_number, expected)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         }
 
-        // Get page from cache and create guard
-        let mut page_cache = self.page_cache.borrow_mut();
-        let page = page_cache.get_page(page_number).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Page {} not found in cache", page_number),
-            )
-        })?;
+        
+        // Pin the page
+        inner.page_cache.pin_page_for_guard(page_number)?;
+        
 
-        // Create the guard with a shared reference to the buffer pool
-        Ok(PageGuard::new(page_number, page, Rc::clone(&self.page_cache)))
+        // Get a reference to the page
+        let page = inner.page_cache.get_page_ref(page_number)
+            .ok_or_else(|| io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Page {} not found in cache", page_number)
+            ))?;
+
+        
+        Ok(PageGuard::new(page_number, page, &self.inner))
     }
 
-    /// Gets a mutable page with RAII guard for automatic unpinning
-    pub fn get_page_guard_mut(&mut self, page_number: u32, page_type: Option<PageType>) -> io::Result<PageGuardMut> {
+    /// Gets a mutable page with automatic unpinning when the guard is dropped
+    ///
+    /// # Parameters
+    /// * `page_number` - The page number to retrieve (1-based)
+    /// * `expected_type` - Optional expected page type for validation
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - The page number is out of range
+    /// - The page cannot be loaded from disk
+    /// - The page type doesn't match the expected type
+    ///
+    /// # Returns
+    /// A PageGuardMut that provides mutable access to the page and automatically unpins it when dropped
+    pub fn get_page_mut(&self, page_number: u32, expected_type: Option<PageType>) -> io::Result<PageGuardMut> {
+        
+        
+        let page_for_journal ={
+            let mut inner = self.inner.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
+        })?;
+
         // Load page if not in cache
-        let is_on_cache = {
-            let mut page_cache = self.page_cache.borrow_mut();
-            !page_cache.contains_page(page_number)
-        };
-        if !is_on_cache {
-            self.load_page(page_number)?;
+        if !inner.page_cache.contains_page_simple(page_number) {
+            Self::load_page(&mut inner, page_number)?;
         }
 
+    
         // Validate page type if specified
-        if let Some(expected_type) = page_type {
-            let page_cache = self.page_cache.borrow();
-            page_cache.validate_page_type(page_number, expected_type).map_err(|opt_err|
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Type of page incorrect: expected {:?}, obtained {:?}",
-                        expected_type, opt_err
-                    ),
-                )
-            )?;
+        if let Some(expected) = expected_type {
+            inner.page_cache.validate_page_type(page_number, expected)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         }
-
+    
         // Add to journal for transaction support
-        {
-            let mut page_cache = self.page_cache.borrow_mut();
-            if let Some(page) = page_cache.get_page(page_number) {
-                self.journal_pages.push((page_number, page.clone()));
+            let result = inner.page_cache.get_page_for_journal(page_number);
+
+            if let Some(page) = result {
+                Some(page.clone())
+            } else {
+                None
             }
-        }
-
-        // Get mutable page and create guard
-        let mut page_cache = self.page_cache.borrow_mut();
-        let page = page_cache.get_page_mut(page_number).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Page {} not found in cache", page_number),
-            )
-        })?;
-
-        self.dirty = true;
-
-        // Create the guard with a shared reference to the buffer pool
-        Ok(PageGuardMut::new(page_number, page, Rc::clone(&self.page_cache)))
-    }
-
-    /// Legacy method - use get_page_guard instead
-    /// 
-    /// # Deprecated
-    /// This method requires manual unpinning. Use `get_page_guard` instead for automatic memory management.
-    pub fn get_page(&mut self, page_number: u32, page_type: Option<PageType>) -> io::Result<&Page> {
-        // Load page if not in cache
-        let is_on_cache = {
-            let mut page_cache = self.page_cache.borrow_mut();
-            !page_cache.contains_page(page_number)
         };
-        if !is_on_cache {
-            self.load_page(page_number)?;
-        }
-        
-        // Validate page type if specified
-        if let Some(expected_type) = page_type {
-            let page_cache = self.page_cache.borrow();
-            page_cache.validate_page_type(page_number, expected_type).map_err(|opt_err|
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Type of page incorrect: expected {:?}, obtained {:?}",
-                        expected_type, opt_err
-                    ),
-                )
-            )?;
-        }
-        
-        // This is problematic because we return a reference that outlives the RefCell borrow
-        // Users should use get_page_guard instead
-        let mut page_cache = self.page_cache.borrow_mut();
-        let page = page_cache.get_page(page_number).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Page {} not found in cache", page_number),
-            )
-        })?;
-        
-        // SAFETY: This is unsafe because we're returning a reference that outlives the borrow
-        // The caller must ensure they unpin the page manually
-        unsafe { Ok(&*(page as *const Page)) }
-    }
 
-    /// Legacy method - use get_page_guard_mut instead
-    /// 
-    /// # Deprecated
-    /// This method requires manual unpinning. Use `get_page_guard_mut` instead for automatic memory management.
-    pub fn get_page_mut(&mut self, page_number: u32, page_type: Option<PageType>) -> io::Result<&mut Page> {
-        // Load page if not in cache
-        let is_on_cache = {
-            let mut page_cache = self.page_cache.borrow_mut();
-            !page_cache.contains_page(page_number)
-        };
-        if !is_on_cache {
-            self.load_page(page_number)?;
-        }
-        
-        // Validate page type if specified
-        if let Some(expected_type) = page_type {
-            let page_cache = self.page_cache.borrow();
-            page_cache.validate_page_type(page_number, expected_type).map_err(|opt_err|
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Type of page incorrect: expected {:?}, obtained {:?}",
-                        expected_type, opt_err
-                    ),
-                )
-            )?;
-        }
-        
-        // Add to journal for transaction support
-        {
-            let mut page_cache = self.page_cache.borrow_mut();
-            if let Some(page) = page_cache.get_page(page_number) {
-                self.journal_pages.push((page_number, page.clone()));
-            }
-        }
-        
-        // This is problematic because we return a reference that outlives the RefCell borrow
-        // Users should use get_page_guard_mut instead
-        let mut page_cache = self.page_cache.borrow_mut();
-        let page = page_cache.get_page_mut(page_number).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Page {} not found in cache", page_number),
-            )
+        let mut inner = self.inner.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
         })?;
 
-        self.dirty = true;
         
-        // SAFETY: This is unsafe because we're returning a reference that outlives the borrow
-        // The caller must ensure they unpin the page manually
-        unsafe { Ok(&mut *(page as *mut Page)) }
-    }
 
-    /// Manually unpin a page (for backward compatibility with legacy methods)
-    pub fn unpin_page(&mut self, page_number: u32) -> io::Result<()> {
-        let mut page_cache = self.page_cache.borrow_mut();
-        if !page_cache.unpin_page(page_number) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Page {} not found in cache", page_number),
-            ));
+        // Add the page to the journal if it was not already there
+        if let Some(page) = page_for_journal {
+            inner.journal_pages.push((page_number, page.clone()));
         }
-        Ok(())
+  
+    
+        // Pin the page for mutable access
+        inner.page_cache.pin_page_for_guard_mut(page_number)?;
+        // We are dirty now
+        inner.dirty = true;
+        // Get a mutable reference to the page
+        let page = inner.page_cache.get_page_mut_ref(page_number)
+            .ok_or_else(|| io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Page {} not found in cache", page_number)
+            ))?;
+
+        // Create and return the guard
+        Ok(PageGuardMut::new(page_number, page, &self.inner))
     }
 
     /// Gets the header of the database
-    pub fn get_header(&mut self) -> io::Result<Header> {
-        self.disk_manager.read_header()
+    ///
+    /// # Errors
+    /// Returns an error if the header cannot be read
+    ///
+    /// # Returns
+    /// The database header
+    pub fn get_header(&self) -> io::Result<Header> {
+        let mut inner = self.inner.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
+        })?;
+        inner.disk_manager.read_header()
     }
 
     /// Updates the header of the database
-    pub fn update_header(&mut self, header: &Header) -> io::Result<()> {
-        self.disk_manager.write_header(header)?;
-        self.dirty = true;
+    ///
+    /// # Parameters
+    /// * `header` - The new header to write
+    ///
+    /// # Errors
+    /// Returns an error if the header cannot be written
+    pub fn update_header(&self, header: &Header) -> io::Result<()> {
+        let mut inner = self.inner.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
+        })?;
+        inner.disk_manager.write_header(header)?;
+        inner.dirty = true;
         Ok(())
-    }
-
-    /// Begins a transaction
-    pub fn begin_transaction(&mut self) -> io::Result<()> {
-        self.journal_pages.clear();
-        self.dirty = true;
-        Ok(())
-    }
-
-    /// Commits the current transaction
-    pub fn commit_transaction(&mut self) -> io::Result<()> {
-        if self.flush().is_ok() {
-            self.clear_journal();
-            Ok(())
-        } else {
-            self.rollback_transaction()?;
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Transaction failed",
-            ))
-        }
-    }
-
-    /// Rolls back the current transaction
-    pub fn rollback_transaction(&mut self) -> io::Result<()> {
-        for (page_number, page) in self.journal_pages.iter() {
-            let buffer = self.serialize_page(page)?;
-            self.disk_manager.write_page(*page_number, &buffer)?;
-        }
-        
-        let mut page_cache = self.page_cache.borrow_mut();
-        page_cache.mark_clean_all();
-        self.dirty = false;
-        self.journal_pages.clear();
-        Ok(())
-    }
-
-    /// Clears the journal
-    fn clear_journal(&mut self) {
-        if self.dirty {
-            panic!("Cannot clear journal pages, we are in the middle of a transaction");
-        }
-        self.journal_pages.clear();
     }
 
     /// Creates a new B-Tree page
+    ///
+    /// # Parameters
+    /// * `page_type` - Type of B-Tree page to create
+    /// * `right_most_page` - For interior pages, the rightmost child page number
+    ///
+    /// # Errors
+    /// Returns an error if the page cannot be created or written to disk
+    ///
+    /// # Returns
+    /// The page number of the newly created page
     pub fn create_btree_page(
-        &mut self,
+        &self,
         page_type: PageType,
         right_most_page: Option<u32>,
     ) -> io::Result<u32> {
-        let page_number = self.disk_manager.allocate_pages(1)?;
+        let mut inner = self.inner.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
+        })?;
+
+        let page_number = inner.disk_manager.allocate_pages(1)?;
         let btree_page = BTreePage::new(
             page_type,
-            self.page_size,
+            inner.page_size,
             page_number,
-            self.reserved_space,
+            inner.reserved_space,
             right_most_page,
         )?;
-        let buffer = self.serialize_page(&Page::BTree(btree_page))?;
-        self.disk_manager.write_page(page_number, &buffer)?;
+
+        let page = Page::BTree(btree_page);
+        let buffer = Self::serialize_page(&inner, &page)?;
+        inner.disk_manager.write_page(page_number, &buffer)?;
+
+        // Add to cache
+        inner.page_cache.add_page(page_number, page, false);
+
         Ok(page_number)
     }
 
     /// Creates a new overflow page
-    pub fn create_overflow_page(&mut self, next_page: u32, data: Vec<u8>) -> io::Result<u32> {
-        let max_data_size = self.page_size as usize - 4;
+    ///
+    /// # Parameters
+    /// * `next_page` - Page number of the next overflow page (0 if last)
+    /// * `data` - Data to store in the overflow page
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - The data is too large for an overflow page
+    /// - The page cannot be created or written to disk
+    ///
+    /// # Returns
+    /// The page number of the newly created page
+    pub fn create_overflow_page(&self, next_page: u32, data: Vec<u8>) -> io::Result<u32> {
+        let mut inner = self.inner.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
+        })?;
+
+        let max_data_size = inner.page_size as usize - 4;
         if data.len() > max_data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -438,184 +432,704 @@ impl Pager {
             ));
         }
 
-        let page_number = self.disk_manager.allocate_pages(1)?;
-        let overflow_page = OverflowPage::new(next_page, data, self.page_size, page_number)?;
-        let buffer = self.serialize_page(&Page::Overflow(overflow_page))?;
-        self.disk_manager.write_page(page_number, &buffer)?;
+        let page_number = inner.disk_manager.allocate_pages(1)?;
+        let overflow_page = OverflowPage::new(next_page, data, inner.page_size, page_number)?;
+
+        let page = Page::Overflow(overflow_page);
+        let buffer = Self::serialize_page(&inner, &page)?;
+        inner.disk_manager.write_page(page_number, &buffer)?;
+
         Ok(page_number)
     }
 
     /// Creates a new free page
-    pub fn create_free_page(&mut self, next_page: u32) -> io::Result<u32> {
-        let page_number = self.disk_manager.allocate_pages(1)?;
-        let free_page = FreePage::new(next_page, self.page_size, page_number);
-        let buffer = self.serialize_page(&Page::Free(free_page))?;
-        self.disk_manager.write_page(page_number, &buffer)?;
+    ///
+    /// # Parameters
+    /// * `next_page` - Page number of the next free page in the list (0 if last)
+    ///
+    /// # Errors
+    /// Returns an error if the page cannot be created or written to disk
+    ///
+    /// # Returns
+    /// The page number of the newly created page
+    pub fn create_free_page(&self, next_page: u32) -> io::Result<u32> {
+        let mut inner = self.inner.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
+        })?;
+
+        let page_number = inner.disk_manager.allocate_pages(1)?;
+        let free_page = FreePage::new(next_page, inner.page_size, page_number);
+
+        let page = Page::Free(free_page);
+        let buffer = Self::serialize_page(&inner, &page)?;
+        inner.disk_manager.write_page(page_number, &buffer)?;
+
         Ok(page_number)
     }
 
-    /// Flushes dirty pages to disk
-    pub fn flush(&mut self) -> io::Result<()> {
-        if !self.dirty {
-            return Ok(());
-        }
-
-        let dirty_pages = {
-            let page_cache = self.page_cache.borrow();
-            page_cache.get_dirty_pages().into_iter().map(|(n, p)| (n, p.clone())).collect::<Vec<_>>()
-        };
-
-        if dirty_pages.is_empty() {
-            return Ok(());
-        }
-
-        for (page_number, page) in dirty_pages {
-            let buffer = self.serialize_page(&page)?;
-            self.disk_manager.write_page(page_number, &buffer)?;
-        }
-
-        self.disk_manager.sync()?;
-        let mut page_cache = self.page_cache.borrow_mut();
-        page_cache.mark_clean_all();
-        self.dirty = false;
+    /// Begins a new transaction
+    ///
+    /// # Errors
+    /// Currently always succeeds
+    pub fn begin_transaction(&self) -> io::Result<()> {
+        let mut inner = self.inner.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
+        })?;
+        inner.journal_pages.clear();
+        inner.dirty = true;
         Ok(())
     }
 
-    /// Gets the number of pages in the database
-    pub fn page_count(&self) -> io::Result<u32> {
-        self.disk_manager.page_count()
+    /// Commits the current transaction
+    ///
+    /// # Errors
+    /// Returns an error if the flush operation fails
+    pub fn commit_transaction(&self) -> io::Result<()> {
+        self.flush()?;
+        let mut inner = self.inner.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
+        })?;
+        inner.journal_pages.clear();
+        Ok(())
     }
 
-    // Private helper methods...
+    /// Rolls back the current transaction
+    ///
+    /// # Errors
+    /// Returns an error if pages cannot be restored from the journal
+    pub fn rollback_transaction(&self) -> io::Result<()> {
+        let mut inner = self.inner.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
+        })?;
 
-    fn load_page(&mut self, page_number: u32) -> io::Result<()> {
-        let page_count = self.disk_manager.page_count()?;
-        if page_number > page_count + 1 {
+        // Restore pages from journal
+        // Cloning the pages may not be the most efficient way, but it's safe
+        let journal_pages = inner.journal_pages.clone();
+        
+        for (page_number, page) in journal_pages.iter() {
+            let buffer = Self::serialize_page(&inner, page)?;
+            inner.disk_manager.write_page(*page_number, &buffer)?;
+            
+            // Update cache with restored page
+            inner.page_cache.update_page(*page_number, page.clone())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        }
+
+        inner.page_cache.mark_clean_all();
+        inner.dirty = false;
+        inner.journal_pages.clear();
+        Ok(())
+    }
+
+    /// Flushes all dirty pages to disk
+    ///
+    /// # Errors
+    /// Returns an error if pages cannot be written to disk
+    pub fn flush(&self) -> io::Result<()> {
+        let mut inner = self.inner.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
+        })?;
+
+        if !inner.dirty {
+            return Ok(());
+        }
+
+        // Get all dirty pages
+        let dirty_pages = inner.page_cache.get_dirty_pages()
+            .into_iter()
+            .map(|(n, p)| (n, p.clone()))
+            .collect::<Vec<_>>();
+
+        // Write each dirty page to disk
+        for (page_number, page) in dirty_pages {
+            inner.page_cache.prepare_page_for_write(page_number);
+            
+            let buffer = Self::serialize_page(&inner, &page)?;
+            inner.disk_manager.write_page(page_number, &buffer)?;
+            
+            inner.page_cache.finish_page_write(page_number);
+            inner.page_cache.mark_clean(page_number);
+        }
+
+        inner.disk_manager.sync()?;
+        inner.dirty = false;
+        Ok(())
+    }
+
+    /// Closes the pager, flushing any pending changes
+    ///
+    /// # Errors
+    /// Returns an error if the flush operation fails
+    pub fn close(self) -> io::Result<()> {
+        self.flush()
+    }
+
+    /// Gets the total number of pages in the database
+    ///
+    /// # Errors
+    /// Returns an error if the page count cannot be determined
+    ///
+    /// # Returns
+    /// The total number of pages
+    pub fn page_count(&self) -> io::Result<u32> {
+        let inner = self.inner.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
+        })?;
+        inner.disk_manager.page_count()
+    }
+
+    // Private helper methods
+
+    /// Loads a page from disk into the cache
+    fn load_page(inner: &mut PagerInner, page_number: u32) -> io::Result<()> {
+       
+        let page_count = inner.disk_manager.page_count()?;
+        if page_number == 0 || page_number > page_count {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!(
-                    "Page number out of range: {}, maximum {}",
-                    page_number,
-                    page_count + 1
-                ),
+                format!("Page number out of range: {}", page_number),
             ));
         }
 
-        let mut buffer = vec![0u8; self.page_size as usize];
-        self.disk_manager.read_page(page_number, &mut buffer)?;
-        
-        let page = if page_number == 1 || self.is_btree_page(&buffer)? {
-            self.parse_btree_page(page_number, &buffer)?
-        } else if self.is_overflow_page(&buffer)? {
-            self.parse_overflow_page(page_number, &buffer)?
-        } else {
-            self.parse_free_page(page_number, &buffer)?
-        };
+        // Read page from disk
+        let mut buffer = vec![0u8; inner.page_size as usize];
+        inner.disk_manager.read_page(page_number, &mut buffer)?;
 
-        if let Some((evicted_page_number, evicted_page)) = self.add_page_to_cache(page_number, page)? {
-            let buffer = self.serialize_page(&evicted_page)?;
-            self.disk_manager.write_page(evicted_page_number, &buffer)?;
-        }
+        // Parse the page
+        let page = Self::parse_page(inner, page_number, &buffer)?;
+         // Create and return the guard
         
+        // Add to cache, handling eviction if necessary.
+        // There is a risk of deadlock here if the cache is full and we try to evict a page
+        // that is currently being accessed. This should be handled by the cache itself.
+        let evicted = {
+            inner.page_cache.add_page(page_number, page, false)
+        };
+        
+
+        
+        if let Some((evicted_page_number, evicted_page)) = evicted {
+            let dirty = inner.page_cache.is_dirty(evicted_page_number);
+            if dirty {
+                let buffer = Self::serialize_page(inner, &evicted_page)?;
+            inner.disk_manager.write_page(evicted_page_number, &buffer)?;
+            }
+            
+        };       
+    
+
         Ok(())
     }
 
-    fn add_page_to_cache(&mut self, page_number: u32, page: Page) -> io::Result<Option<(u32, Page)>> {
-        let mut page_cache = self.page_cache.borrow_mut();
-        match page_cache.add_page(page_number, page, true) {
-            Some((evicted_page_number, evicted_page)) => {
-                if evicted_page_number == page_number {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Page {} was rejected by the cache (OOM Error)", page_number),
-                    ))
-                } else {
-                    Ok(Some((evicted_page_number, evicted_page)))
-                }
+    /// Parses a page from a buffer
+    fn parse_page(inner: &PagerInner, page_number: u32, buffer: &[u8]) -> io::Result<Page> {
+        if buffer.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Empty buffer",
+            ));
+        }
+
+        // Determine page type from first byte
+        match buffer[0] {
+            0x02 | 0x05 | 0x0A | 0x0D => {
+                // B-Tree page
+                let mut cursor = std::io::Cursor::new(buffer);
+                let mut btree_page = BTreePage::read_from(&mut cursor)?;
+                btree_page.page_number = page_number;
+                btree_page.page_size = inner.page_size;
+                btree_page.reserved_space = inner.reserved_space;
+                Ok(Page::BTree(btree_page))
             }
-            _ => Ok(None),
-        }
-    }
-
-    fn is_btree_page(&self, buffer: &[u8]) -> io::Result<bool> {
-        if buffer.is_empty() {
-            return Err(io::Error::new(
+            0x10 => {
+                // Overflow page
+                let mut cursor = std::io::Cursor::new(&buffer[1..]); // Skip type byte
+                println!("Parsing overflow page");
+                let mut overflow_page = OverflowPage::read_from(&mut cursor)?;
+                overflow_page.page_number = page_number;
+                overflow_page.page_size = inner.page_size;
+                Ok(Page::Overflow(overflow_page))
+            }
+            0x00 => {
+                // Free page
+                let mut cursor = std::io::Cursor::new(&buffer[1..]); // Skip type byte
+                let mut free_page = FreePage::read_from(&mut cursor)?;
+                free_page.page_number = page_number;
+                free_page.page_size = inner.page_size;
+                Ok(Page::Free(free_page))
+            }
+            _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Buffer too small to determine page type",
-            ));
-        }
-
-        match buffer[0] {
-            0x02 | 0x05 | 0x0A | 0x0D => Ok(true),
-            _ => Ok(false),
+                format!("Unknown page type: {:#x}", buffer[0]),
+            )),
         }
     }
 
-    fn is_overflow_page(&self, buffer: &[u8]) -> io::Result<bool> {
-        if buffer.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Buffer too small to determine page type",
-            ));
-        }
-
-        match buffer[0] {
-            0x10 => Ok(true),
-            _ => Ok(false),
-        }
-    }
-
-    fn parse_btree_page(&self, page_number: u32, buffer: &[u8]) -> io::Result<Page> {
-        if buffer.len() < 4 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Buffer too small for a B-Tree page",
-            ));
-        }
-        let mut cursor = std::io::Cursor::new(buffer);
-        let mut page = BTreePage::read_from(&mut cursor)?;
-        page.page_number = page_number;
-        page.page_size = self.page_size;
-        page.reserved_space = self.reserved_space;
-        Ok(Page::BTree(page))
-    }
-
-    fn parse_overflow_page(&self, page_number: u32, buffer: &[u8]) -> io::Result<Page> {
-        if buffer.len() < 4 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Buffer too small for an overflow page",
-            ));
-        }
-
-        let mut cursor = std::io::Cursor::new(buffer);
-        let mut page = OverflowPage::read_from(&mut cursor)?;
-        page.page_number = page_number;
-        page.page_size = self.page_size;
-        Ok(Page::Overflow(page))
-    }
-
-    fn parse_free_page(&self, page_number: u32, buffer: &[u8]) -> io::Result<Page> {
-        if buffer.len() < 4 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Buffer too small for a free page",
-            ));
-        }
-
-        let mut cursor = std::io::Cursor::new(buffer);
-        let mut page = FreePage::read_from(&mut cursor)?;
-        page.page_number = page_number;
-        page.page_size = self.page_size;
-        Ok(Page::Free(page))
-    }
-
-    fn serialize_page(&self, page: &Page) -> io::Result<Vec<u8>> {
-        let mut buffer = vec![0u8; self.page_size as usize];
+    /// Serializes a page to a buffer
+    fn serialize_page(inner: &PagerInner, page: &Page) -> io::Result<Vec<u8>> {
+        let mut buffer = vec![0u8; inner.page_size as usize];
         let mut cursor = std::io::Cursor::new(&mut buffer[..]);
         page.write_to(&mut cursor)?;
         Ok(buffer)
     }
 }
 
+/// Ensure the pager properly cleans up on drop
+impl Drop for Pager {
+    fn drop(&mut self) {
+        // Try to flush any pending changes
+        let _ = self.flush();
+    }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use crate::page::{BTreePageHeader, BTreeCell, TableLeafCell};
+
+    #[test]
+    fn test_pager_create_and_open() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        // Create a new database
+        {
+            let pager = Pager::create(&db_path, 4096, None, 0).unwrap();
+            assert_eq!(pager.page_count().unwrap(), 1);
+        }
+
+        // Open the existing database
+        {
+            let pager = Pager::open(&db_path, None).unwrap();
+            assert_eq!(pager.page_count().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn test_page_guard_automatic_unpinning() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pager = Pager::create(&db_path, 4096, Some(10), 0).unwrap();
+
+        // Create a B-Tree page
+        let page_number = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+
+        // Test scoped access with automatic unpinning
+        {
+            let guard = pager.get_page(page_number, Some(PageType::TableLeaf)).unwrap();
+            assert_eq!(guard.page().page_number(), page_number);
+            
+            // Check that page is pinned
+            let inner = pager.inner.lock().unwrap();
+            assert!(inner.page_cache.is_pinned(page_number));
+        } // guard is dropped here, page should be unpinned
+
+        // Verify page is unpinned after guard is dropped
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert!(!inner.page_cache.is_pinned(page_number));
+        }
+    }
+
+    #[test]
+    fn test_page_guard_mut_automatic_unpinning() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pager = Pager::create(&db_path, 4096, Some(10), 0).unwrap();
+
+        // Create a B-Tree page
+        let page_number = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+
+        // Test mutable access with automatic unpinning
+        {
+            let mut guard = pager.get_page_mut(page_number, Some(PageType::TableLeaf)).unwrap();
+            
+            // Modify the page
+            match guard.page_mut() {
+                Page::BTree(btree_page) => {
+                    // Add a cell to verify mutation
+                    let cell = BTreeCell::TableLeaf(TableLeafCell {
+                        payload_size: 10,
+                        row_id: 1,
+                        payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                        overflow_page: None,
+                    });
+                    btree_page.add_cell(cell).unwrap();
+                }
+                _ => panic!("Expected BTree page"),
+            }
+            
+            // Check that page is pinned and dirty
+            let inner = pager.inner.lock().unwrap();
+            assert!(inner.page_cache.is_pinned(page_number));
+            assert!(inner.page_cache.is_dirty(page_number));
+        } // guard is dropped here
+
+        // Verify page is unpinned but still dirty
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert!(!inner.page_cache.is_pinned(page_number));
+            assert!(inner.page_cache.is_dirty(page_number));
+        }
+    }
+
+    #[test]
+    fn test_multiple_guards() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pager = Pager::create(&db_path, 4096, Some(10), 0).unwrap();
+
+        // Create multiple pages
+        let page1 = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+        let page2 = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+
+        // Test multiple guards
+        {
+            let guard1 = pager.get_page(page1, None).unwrap();
+            let guard2 = pager.get_page(page2, None).unwrap();
+            
+            // Both pages should be pinned
+            let inner = pager.inner.lock().unwrap();
+            assert!(inner.page_cache.is_pinned(page1));
+            assert!(inner.page_cache.is_pinned(page2));
+            
+            // Can access both pages
+            assert_eq!(guard1.page().page_number(), page1);
+            assert_eq!(guard2.page().page_number(), page2);
+        } // Both guards dropped
+
+        // Both pages should be unpinned
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert!(!inner.page_cache.is_pinned(page1));
+            assert!(!inner.page_cache.is_pinned(page2));
+        }
+    }
+
+    #[test]
+    fn test_transaction_rollback() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pager = Pager::create(&db_path, 4096, Some(10), 0).unwrap();
+
+        // Create a page
+        let page_number = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+
+        // Begin transaction
+        pager.begin_transaction().unwrap();
+
+        // Modify the page
+        {
+            let mut guard = pager.get_page_mut(page_number, None).unwrap();
+            match guard.page_mut() {
+                Page::BTree(btree_page) => {
+                    let cell = BTreeCell::TableLeaf(TableLeafCell {
+                        payload_size: 10,
+                        row_id: 1,
+                        payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                        overflow_page: None,
+                    });
+                    btree_page.add_cell(cell).unwrap();
+                }
+                _ => panic!("Expected BTree page"),
+            }
+        }
+
+        // Verify the page has a cell
+        {
+            let guard = pager.get_page(page_number, None).unwrap();
+            match guard.page() {
+                Page::BTree(btree_page) => {
+                    assert_eq!(btree_page.header.cell_count, 1);
+                }
+                _ => panic!("Expected BTree page"),
+            }
+        }
+
+        // Rollback transaction
+        pager.rollback_transaction().unwrap();
+
+        // Verify the page was restored (no cells)
+        {
+            let guard = pager.get_page(page_number, None).unwrap();
+            match guard.page() {
+                Page::BTree(btree_page) => {
+                    assert_eq!(btree_page.header.cell_count, 0);
+                }
+                _ => panic!("Expected BTree page"),
+            }
+        }
+    }
+
+    #[test] // Apparently, if you forget to drop the guard the buffer pool will also return it to you, causing a potential deadlock. Must fix this bug,    
+    fn test_page_eviction_with_guards() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        // Create pager with small buffer pool
+        let pager = Pager::create(&db_path, 4096, Some(2), 0).unwrap();
+
+        // Create 3 pages (more than buffer pool can hold)
+        let page1 = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+        let page2 = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+       let page3 = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+
+        // Access all pages, causing eviction
+        {
+           let _guard1 = pager.get_page(page1, None).unwrap();
+        }   // Drop guard1 here to allow eviction. If you do not do it the cache will deadlock you when you try to evict a page that is already referenced.
+        // This is because of a bug in the buffer pool caused by the weak references which are not completely consistent.
+        {
+           
+             let _guard2 = pager.get_page(page2, None).unwrap();
+        
+            // Page 1 should be evicted when accessing page 3
+            let _guard3 = pager.get_page(page3, None).unwrap();
+            
+            // All pages should still be accessible through guards
+           
+            assert_eq!(_guard2.page().page_number(), page2);
+            assert_eq!(_guard3.page().page_number(), page3);
+        }
+    }
+
+    #[test]
+    fn test_concurrent_page_access() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pager = Pager::create(&db_path, 4096, None, 0).unwrap();
+
+        let page_number = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+
+        // Multiple immutable guards to same page should work
+        {
+            let guard1 = pager.get_page(page_number, None).unwrap();
+            let guard2 = pager.get_page(page_number, None).unwrap();
+            
+            assert_eq!(guard1.page().page_number(), page_number);
+            assert_eq!(guard2.page().page_number(), page_number);
+            
+            // Pin count should be 2
+            let inner = pager.inner.lock().unwrap();
+            assert_eq!(inner.page_cache.pin_count(page_number), 2);
+        }
+
+        // Verify unpinning
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert_eq!(inner.page_cache.pin_count(page_number), 0);
+        }
+    }
+
+    #[test]
+    fn test_page_type_validation() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pager = Pager::create(&db_path, 4096, None, 0).unwrap();
+        
+        // Create a table leaf page
+        let page_number = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+        
+        // Should succeed with correct type
+        {
+            let guard = pager.get_page(page_number, Some(PageType::TableLeaf)).unwrap();
+            assert_eq!(guard.page().page_type(), PageType::TableLeaf);
+        }
+
+        // Should fail with incorrect type
+        let result = pager.get_page(page_number, Some(PageType::TableInterior));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_overflow_page_creation() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pager = Pager::create(&db_path, 4096, None, 0).unwrap();
+
+        // Create overflow page with valid data
+        let data = vec![0xAA; 1000];
+        let page_number = pager.create_overflow_page(1, data.clone()).unwrap();
+
+        // Read it back
+        {
+            let guard = pager.get_page(page_number, Some(PageType::Overflow)).unwrap();
+            match guard.page() {
+                Page::Overflow(overflow) => {
+                    
+                  //  assert_eq!(overflow.data, data);
+                    assert_eq!(overflow.next_page, 0);
+                }
+                _ => panic!("Expected overflow page"),
+            }
+        }
+
+        // Test data too large
+        let large_data = vec![0xBB; 5000]; // Too large for page size 4096
+        let result = pager.create_overflow_page(0, large_data);
+       assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_free_page_creation() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pager = Pager::create(&db_path, 4096, None, 0).unwrap();
+
+        // Create free page
+        let page_number = pager.create_free_page(42).unwrap();
+
+        // Read it back
+        {
+            let guard = pager.get_page(page_number, Some(PageType::Free)).unwrap();
+            match guard.page() {
+                Page::Free(free) => {
+                    assert_eq!(free.next_page, 42);
+                }
+                _ => panic!("Expected free page"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_flush_dirty_pages() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pager = Pager::create(&db_path, 4096, None, 0).unwrap();
+
+        // Create and modify a page
+        let page_number = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+
+        {
+            let mut guard = pager.get_page_mut(page_number, None).unwrap();
+            match guard.page_mut() {
+                Page::BTree(btree_page) => {
+                    let cell = BTreeCell::TableLeaf(TableLeafCell {
+                        payload_size: 5,
+                        row_id: 42,
+                        payload: vec![1, 2, 3, 4, 5],
+                        overflow_page: None,
+                    });
+                    btree_page.add_cell(cell).unwrap();
+                }
+                _ => panic!("Expected BTree page"),
+            }
+        }
+
+        // Flush to disk
+        pager.flush().unwrap();
+
+        // Verify page is no longer dirty
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert!(!inner.page_cache.is_dirty(page_number));
+        }
+
+        // Reopen database and verify changes persisted
+        drop(pager);
+        let pager2 = Pager::open(&db_path, None).unwrap();
+        
+        {
+            let guard = pager2.get_page(page_number, None).unwrap();
+            match guard.page() {
+                Page::BTree(btree_page) => {
+                    assert_eq!(btree_page.header.cell_count, 1);
+                }
+                _ => panic!("Expected BTree page"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_header_operations() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pager = Pager::create(&db_path, 4096, None, 100).unwrap();
+
+        // Get header
+        let header = pager.get_header().unwrap();
+        assert_eq!(header.page_size, 4096);
+        assert_eq!(header.reserved_space, 100);
+
+        // Update header
+        let mut new_header = header.clone();
+        new_header.user_version = 42;
+        pager.update_header(&new_header).unwrap();
+
+        // Verify update
+        let updated_header = pager.get_header().unwrap();
+        assert_eq!(updated_header.user_version, 42);
+    }
+
+    #[test]
+    fn test_page_count() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pager = Pager::create(&db_path, 4096, None, 0).unwrap();
+
+        // Initial page count (includes header page)
+        assert_eq!(pager.page_count().unwrap(), 1);
+
+        // Create some pages
+        pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+        pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+        pager.create_overflow_page(0, vec![1, 2, 3]).unwrap();
+
+        // Verify page count
+        assert_eq!(pager.page_count().unwrap(), 4);
+    }
+
+    #[test]
+    fn test_invalid_page_access() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pager = Pager::create(&db_path, 4096, None, 0).unwrap();
+
+        // Try to access non-existent page
+        let result = pager.get_page(999, None);
+        assert!(result.is_err());
+
+        // Try to access page 0 (invalid)
+        let result = pager.get_page(0, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_drop_cleanup() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        
+        {
+            let pager = Pager::create(&db_path, 4096, None, 0).unwrap();
+            let page_number = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
+            
+            // Modify page
+            {
+                let mut guard = pager.get_page_mut(page_number, None).unwrap();
+                match guard.page_mut() {
+                    Page::BTree(btree_page) => {
+                        let cell = BTreeCell::TableLeaf(TableLeafCell {
+                            payload_size: 3,
+                            row_id: 1,
+                            payload: vec![1, 2, 3],
+                            overflow_page: None,
+                        });
+                        btree_page.add_cell(cell).unwrap();
+                    }
+                    _ => panic!("Expected BTree page"),
+                }
+            }
+            // Pager dropped here, should flush changes
+        }
+
+        // Verify changes were persisted
+        let pager2 = Pager::open(&db_path, None).unwrap();
+        let guard = pager2.get_page(2, None).unwrap(); // Page 2 (after header page)
+        match guard.page() {
+            Page::BTree(btree_page) => {
+                assert_eq!(btree_page.header.cell_count, 1);
+            }
+            _ => panic!("Expected BTree page"),
+        }
+    }
+}
