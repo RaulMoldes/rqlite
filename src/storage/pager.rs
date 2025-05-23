@@ -9,7 +9,9 @@ use std::cell::{RefCell, Cell};
 use std::io;
 use std::path::Path;
 use std::rc::{Rc};
-use std::sync::{Arc, Weak};
+use std::ops::{Deref, DerefMut};
+
+use std::sync::{Arc, Weak,};
 use std::sync::Mutex;
 
 use super::cache::BufferPool;
@@ -32,101 +34,85 @@ struct PagerInner {
 /// Automatically unpins the page when dropped
 pub struct PageGuard {
     page_number: u32,
-    pager: Weak<Mutex<PagerInner>>,
+    pager: Arc<Mutex<PagerInner>>,
     /// We store a raw pointer to avoid lifetime issues, but ensure safety through pinning
-    page_ptr: *const Page,
+    _phantom: std::marker::PhantomData<Page>,
 }
 
 impl PageGuard {
-    /// Creates a new PageGuard
-    /// 
-    /// # Safety
-    /// The page pointer must remain valid for the lifetime of the guard.
-    /// This is ensured by the pinning mechanism in the buffer pool.
-    fn new(page_number: u32, page: &Page, pager: &Arc<Mutex<PagerInner>>) -> Self {
-        PageGuard {
-            page_number,
-            pager: Arc::downgrade(pager),
-            page_ptr: page as *const Page,
-        }
-    }
+    
     
     /// Gets a reference to the page
     pub fn page(&self) -> &Page {
-        // Safe because:
-        // 1. The page is pinned in the buffer pool
-        // 2. The guard ensures the page stays pinned until dropped
-        unsafe { &*self.page_ptr }
+         // This is a bit tricky - we need to ensure the page stays valid
+        // We'll use a callback-based approach to ensure safety
+        unsafe {
+            // We know the page is pinned and won't be evicted
+            let inner = self.pager.lock().unwrap();
+            let page_ptr = inner.page_cache.get_page_ref(self.page_number).unwrap();
+            // Extend the lifetime - safe because the page is pinned
+            std::mem::transmute::<&Page, &Page>(page_ptr)
+        }
+    
     }
 }
 
 impl Drop for PageGuard {
     fn drop(&mut self) {
-        // Try to upgrade the weak reference
-        if let Some(pager) = self.pager.upgrade() {
-            // Try to lock the pager
-            if let Ok(mut inner) = pager.lock() {
-                // Unpin the page
-                let _ = inner.page_cache.unpin_page(self.page_number);
-            }
+        if let Ok(mut inner) = self.pager.lock() {
+            let _ = inner.page_cache.unpin_page(self.page_number);
         }
         // If we can't upgrade or lock, the pager has been dropped
         // and cleanup has already happened
     }
 }
-
 /// RAII guard for mutable page access
 /// Automatically unpins the page when dropped
 pub struct PageGuardMut {
     page_number: u32,
-    pager: Weak<Mutex<PagerInner>>,// Using Weak to avoid circular reference, ensuring the page guard can be dropped
-    /// We store a raw pointer to avoid lifetime issues, but ensure safety through pinning
-    page_ptr: *mut Page,
+    pager: Arc<Mutex<PagerInner>>,
+    _phantom: std::marker::PhantomData<Page>,
 }
 
 impl PageGuardMut {
-    /// Creates a new PageGuardMut
-    /// 
-    /// # Safety
-    /// The page pointer must remain valid for the lifetime of the guard.
-    /// This is ensured by the pinning mechanism in the buffer pool.
-    fn new(page_number: u32, page: &mut Page, pager: &Arc<Mutex<PagerInner>>) -> Self {
-        PageGuardMut {
-            page_number,
-            pager: Arc::downgrade(pager),
-            page_ptr: page as *mut Page,
-        }
-    }
-    
     /// Gets a reference to the page
     pub fn page(&self) -> &Page {
-        // Safe because:
-        // 1. The page is pinned in the buffer pool
-        // 2. The guard ensures the page stays pinned until dropped
-        unsafe { &*self.page_ptr }
+        unsafe {
+            let inner = self.pager.lock().unwrap();
+            let page_ptr = inner.page_cache.get_page_ref(self.page_number).unwrap();
+            std::mem::transmute::<&Page, &Page>(page_ptr)
+        }
     }
     
     /// Gets a mutable reference to the page
     pub fn page_mut(&mut self) -> &mut Page {
-        // Safe because:
-        // 1. The page is pinned in the buffer pool
-        // 2. The guard ensures exclusive access through Rust's borrowing rules
-        unsafe { &mut *self.page_ptr }
+        unsafe {
+            let mut inner = self.pager.lock().unwrap();
+            let page_ptr = inner.page_cache.get_page_mut_ref(self.page_number).unwrap();
+            std::mem::transmute::<&mut Page, &mut Page>(page_ptr)
+        }
+    }
+}
+
+impl Deref for PageGuardMut {
+    type Target = Page;
+    
+    fn deref(&self) -> &Self::Target {
+        self.page()
+    }
+}
+
+impl DerefMut for PageGuardMut {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.page_mut()
     }
 }
 
 impl Drop for PageGuardMut {
     fn drop(&mut self) {
-        // Try to upgrade the weak reference
-        if let Some(pager) = self.pager.upgrade() {
-            // Try to lock the pager
-            if let Ok(mut inner) = pager.lock() {
-                // Unpin the page
-                let _ = inner.page_cache.unpin_page(self.page_number);
-            }
+        if let Ok(mut inner) = self.pager.lock() {
+            let _ = inner.page_cache.unpin_page(self.page_number);
         }
-        // If we can't upgrade or lock, the pager has been dropped
-        // and cleanup has already happened
     }
 }
 
@@ -251,15 +237,14 @@ impl Pager {
         inner.page_cache.pin_page_for_guard(page_number)?;
         
 
-        // Get a reference to the page
-        let page = inner.page_cache.get_page_ref(page_number)
-            .ok_or_else(|| io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Page {} not found in cache", page_number)
-            ))?;
+
 
         
-        Ok(PageGuard::new(page_number, page, &self.inner))
+        Ok(PageGuard{
+            page_number,
+            pager: Arc::clone(&self.inner),
+            _phantom: std::marker::PhantomData,
+        })
     }
 
     /// Gets a mutable page with automatic unpinning when the guard is dropped
@@ -322,15 +307,55 @@ impl Pager {
         inner.page_cache.pin_page_for_guard_mut(page_number)?;
         // We are dirty now
         inner.dirty = true;
-        // Get a mutable reference to the page
-        let page = inner.page_cache.get_page_mut_ref(page_number)
-            .ok_or_else(|| io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Page {} not found in cache", page_number)
-            ))?;
+        
 
         // Create and return the guard
-        Ok(PageGuardMut::new(page_number, page, &self.inner))
+        Ok(PageGuardMut {
+            page_number,
+            pager: Arc::clone(&self.inner),
+            _phantom: std::marker::PhantomData,
+        })
+    }
+
+
+    /// Gets a page using a callback to avoid lifetime issues
+    ///
+    /// # Parameters
+    /// * `page_number` - The page number to retrieve
+    /// * `expected_type` - Optional expected page type
+    /// * `f` - Callback function that receives the page reference
+    ///
+    /// # Errors
+    /// Returns an error if the page cannot be loaded or doesn't match the expected type
+    ///
+    /// # Returns
+    /// The result of the callback function
+    pub fn get_page_callback<F, R>(&self, page_number: u32, expected_type: Option<PageType>, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&Page) -> R,
+    {
+        let guard = self.get_page(page_number, expected_type)?;
+        Ok(f(guard.page()))
+    }
+
+    /// Gets a mutable page using a callback to avoid lifetime issues
+    ///
+    /// # Parameters
+    /// * `page_number` - The page number to retrieve
+    /// * `expected_type` - Optional expected page type
+    /// * `f` - Callback function that receives the mutable page reference
+    ///
+    /// # Errors
+    /// Returns an error if the page cannot be loaded or doesn't match the expected type
+    ///
+    /// # Returns
+    /// The result of the callback function
+    pub fn get_page_mut_callback<F, R>(&self, page_number: u32, expected_type: Option<PageType>, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&mut Page) -> io::Result<R>,
+    {
+        let mut guard = self.get_page_mut(page_number, expected_type)?;
+        f(&mut guard.page_mut())
     }
 
     /// Gets the header of the database
@@ -420,7 +445,7 @@ impl Pager {
             io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
         })?;
 
-        let max_data_size = inner.page_size as usize - 4;
+        let max_data_size = inner.page_size as usize - 5;
         if data.len() > max_data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -438,7 +463,7 @@ impl Pager {
         let page = Page::Overflow(overflow_page);
         let buffer = Self::serialize_page(&inner, &page)?;
         inner.disk_manager.write_page(page_number, &buffer)?;
-
+        inner.disk_manager.sync()?;
         Ok(page_number)
     }
 
@@ -877,10 +902,8 @@ mod tests {
         // Access all pages, causing eviction
         {
            let _guard1 = pager.get_page(page1, None).unwrap();
-        }   // Drop guard1 here to allow eviction. If you do not do it the cache will deadlock you when you try to evict a page that is already referenced.
-        // This is because of a bug in the buffer pool caused by the weak references which are not completely consistent.
-        {
-           
+        
+        }{
              let _guard2 = pager.get_page(page2, None).unwrap();
         
             // Page 1 should be evicted when accessing page 3

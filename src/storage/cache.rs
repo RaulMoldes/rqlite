@@ -237,10 +237,6 @@ impl BufferPool {
             None
         };
 
-        // println!("Evicted page: {:?}", evicted);
-        if page_number == 4 {
-            panic!("Page number 4 is not allowed");
-        }
        
 
         if evicted.is_none() && self.frames.len() >= self.max_pages && !self.frames.contains_key(&page_number) {
