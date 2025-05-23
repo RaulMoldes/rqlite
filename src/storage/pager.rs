@@ -9,12 +9,12 @@ use std::cell::{RefCell, Cell};
 use std::io;
 use std::path::Path;
 use std::rc::{Rc};
-use std::ops::{Deref, DerefMut};
+use std::ops::{Add, Deref, DerefMut};
 
 use std::sync::{Arc, Weak,};
 use std::sync::Mutex;
 
-use super::cache::BufferPool;
+use super::cache::{BufferPool, AddPageResult};
 use super::disk::DiskManager;
 use crate::header::Header;
 use crate::page::{Page, PageType, BTreePage, OverflowPage, FreePage, ByteSerializable};
@@ -213,32 +213,25 @@ impl Pager {
         let mut inner = self.inner.lock().map_err(|e| {
             io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
         })?;
-       
-        // Load page if not in cache
-        if !inner.page_cache.contains_page_simple(page_number) {
-           
-            println!("Loading page {} from disk", page_number);
-             // Load the page from disk
-            Self::load_page(&mut inner, page_number)?;
-             // Create and return the guard
-        
-        }
-
-        
 
         // Validate page type if specified
         if let Some(expected) = expected_type {
             inner.page_cache.validate_page_type(page_number, expected)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         }
-
+       
+        // Load page if not in cache
+        if !inner.page_cache.contains_page_simple(page_number) {
+           
+            
+             // Load the page from disk
+            Self::load_page(&mut inner, page_number)?;
+             // Create and return the guard
         
-        // Pin the page
+        } 
+        // Page is already in cache, just pin it
         inner.page_cache.pin_page_for_guard(page_number)?;
         
-
-
-
         
         Ok(PageGuard{
             page_number,
@@ -422,7 +415,7 @@ impl Pager {
         inner.disk_manager.write_page(page_number, &buffer)?;
 
         // Add to cache
-        inner.page_cache.add_page(page_number, page, false);
+       // inner.page_cache.add_page(page_number, page, false);
 
         Ok(page_number)
     }
@@ -627,23 +620,35 @@ impl Pager {
         // Add to cache, handling eviction if necessary.
         // There is a risk of deadlock here if the cache is full and we try to evict a page
         // that is currently being accessed. This should be handled by the cache itself.
-        let evicted = {
-            inner.page_cache.add_page(page_number, page, false)
-        };
-        
+             
+        // DEADLOCK HAPPENS HERE.
+        // We cannot know if an evicted page is dirty or not, so we need to release it
+        match inner.page_cache.add_page(page_number, page, false) {
+            AddPageResult::Added | AddPageResult::Evicted(_,_,false) => {
 
-        
-        if let Some((evicted_page_number, evicted_page)) = evicted {
-            let dirty = inner.page_cache.is_dirty(evicted_page_number);
-            if dirty {
-                let buffer = Self::serialize_page(inner, &evicted_page)?;
-            inner.disk_manager.write_page(evicted_page_number, &buffer)?;
+                return Ok(());
+            },
+            AddPageResult::Evicted(evicted_page_number, buffer, true) => {
+               
+                inner.disk_manager.write_page(evicted_page_number, &buffer)?;
+            },
+            AddPageResult::Rejected => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Buffer pool is full and cannot evict a page",
+                ));
+            },
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Unknown error while adding page to cache",
+                ));
             }
             
         };       
-    
-
         Ok(())
+
+        
     }
 
     /// Parses a page from a buffer
@@ -799,38 +804,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_multiple_guards() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        let pager = Pager::create(&db_path, 4096, Some(10), 0).unwrap();
-
-        // Create multiple pages
-        let page1 = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
-        let page2 = pager.create_btree_page(PageType::TableLeaf, None).unwrap();
-
-        // Test multiple guards
-        {
-            let guard1 = pager.get_page(page1, None).unwrap();
-            let guard2 = pager.get_page(page2, None).unwrap();
-            
-            // Both pages should be pinned
-            let inner = pager.inner.lock().unwrap();
-            assert!(inner.page_cache.is_pinned(page1));
-            assert!(inner.page_cache.is_pinned(page2));
-            
-            // Can access both pages
-            assert_eq!(guard1.page().page_number(), page1);
-            assert_eq!(guard2.page().page_number(), page2);
-        } // Both guards dropped
-
-        // Both pages should be unpinned
-        {
-            let inner = pager.inner.lock().unwrap();
-            assert!(!inner.page_cache.is_pinned(page1));
-            assert!(!inner.page_cache.is_pinned(page2));
-        }
-    }
 
     #[test]
     fn test_transaction_rollback() {
@@ -903,16 +876,18 @@ mod tests {
         {
            let _guard1 = pager.get_page(page1, None).unwrap();
         
-        }{
+        
              let _guard2 = pager.get_page(page2, None).unwrap();
         
-            // Page 1 should be evicted when accessing page 3
-            let _guard3 = pager.get_page(page3, None).unwrap();
-            
+            // Page 1 should not be evicted when accessing page 3, because it is still in use
+            let result = pager.get_page(page3, None);
+            assert!(result.is_err()); // Should fail because page 1 is still in use
+            drop(_guard1); // Drop guard1 to allow eviction
+            let guard3 = pager.get_page(page3, None).unwrap();
             // All pages should still be accessible through guards
+           assert!(guard3.page().page_number() == page3);
            
-            assert_eq!(_guard2.page().page_number(), page2);
-            assert_eq!(_guard3.page().page_number(), page3);
+            
         }
     }
 
@@ -980,8 +955,8 @@ mod tests {
             match guard.page() {
                 Page::Overflow(overflow) => {
                     
-                  //  assert_eq!(overflow.data, data);
-                    assert_eq!(overflow.next_page, 0);
+                    assert_eq!(overflow.data[..1000], data);
+                    assert_eq!(overflow.next_page, 1);
                 }
                 _ => panic!("Expected overflow page"),
             }

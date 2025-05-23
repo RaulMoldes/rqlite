@@ -959,7 +959,6 @@ impl ByteSerializable for OverflowPage {
         // Read next page pointer
         let mut buffer = [0u8; 4];
         reader.read_exact(&mut buffer)?;
-
         let next_page = u32::from_be_bytes(buffer);
         println!("Next page: {}", next_page);
         // Read the page_size:
@@ -1134,6 +1133,7 @@ impl ByteSerializable for Page {
             // Overflow page
             0x10 => {
                 // Skip the first byte and parse as Overflow page
+                println!("Reading overflow page");
                 let overflow_page = OverflowPage::read_from(reader)?;
                 Ok(Page::Overflow(overflow_page))
             }

@@ -1,9 +1,23 @@
 // Additional improvements to your BufferPool implementation
 
-use crate::page::{PageType, Page};
-use core::panic;
+use crate::page::{self, ByteSerializable, Page, PageType};
+
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::vec::Vec;
+
+
+
+/// Result of adding a page to the buffer pool
+pub enum AddPageResult {
+    /// Page was successfully added, no eviction needed
+    Added,
+    /// Page was successfully added, another page was evicted
+    /// Contains (page_number, page, was_dirty)
+    Evicted(u32, Vec<u8>, bool),
+    /// Page could not be added because buffer is full and no pages can be evicted
+    Rejected,
+}
 
 /// Enhanced BufferFrame with better tracking
 #[derive(Debug)]
@@ -124,6 +138,73 @@ impl BufferPool {
         }
     }
 
+    /// Enhanced add_page that returns detailed result
+    pub fn add_page(&mut self, page_number: u32, page: Page, pin: bool) -> AddPageResult {
+        // If page already exists, just update it
+        if self.frames.contains_key(&page_number) {
+            if let Some(frame) = self.frames.get_mut(&page_number) {
+                frame.page = page;
+                if pin {
+                    frame.pin();
+                    self.stats.pin_operations += 1;
+                }
+            }
+            return AddPageResult::Added;
+        }
+
+        // Check if we need to evict
+        if self.frames.len() >= self.max_pages {
+            // Try to evict a page
+            
+            let evicted = self.evict_page_smart();
+            
+            match evicted {
+                Some((evicted_num, evicted_page)) => {
+                    // Get dirty status before the page is gone
+                    let was_dirty = self.frames.get(&evicted_num)
+                        .map(|f| f.is_dirty())
+                        .unwrap_or(false);
+                    
+                    // Now add the new page
+                    let mut frame = BufferFrame::new(page);
+                    if pin {
+                        frame.pin();
+                        self.stats.pin_operations += 1;
+                    } else {
+                        self.lru_list.push_back(page_number);
+                    }
+                    self.frames.insert(page_number, frame);
+
+                    let size = evicted_page.page_size();
+                    let mut buffer = vec![0u8; size as usize];
+                    evicted_page.write_to(&mut buffer).expect("Failed to serialize page to buffer");
+                    println!("Evicted page {} from buffer pool", evicted_num);
+                    
+                    return AddPageResult::Evicted(evicted_num, buffer, was_dirty);
+                }
+                None => {
+                    // Could not evict any page
+                    println!("Buffer is full and no pages can be evicted");
+                    return AddPageResult::Rejected;
+                }
+            }
+        }
+
+        // Buffer has space, just add the page
+        let mut frame = BufferFrame::new(page);
+        if pin {
+            frame.pin();
+            self.stats.pin_operations += 1;
+        } else {
+            self.lru_list.push_back(page_number);
+        }
+        self.frames.insert(page_number, frame);
+        
+        AddPageResult::Added
+    }
+
+    
+
     /// Enhanced contains_page with statistics tracking
     pub fn contains_page(&mut self, page_number: u32) -> bool {
         let contains = self.frames.contains_key(&page_number);
@@ -226,42 +307,6 @@ impl BufferPool {
             .collect()
     }
 
-    /// Enhanced add_page with better eviction logic
-    pub fn add_page(&mut self, page_number: u32, page: Page, pin: bool) -> Option<(u32, Page)> {
-        // Check if we need to evict a page
-        
-        let evicted = if self.frames.len() >= self.max_pages && !self.frames.contains_key(&page_number) {
-            self.evict_page_smart()
-            //self.evict_page_original()
-        } else {
-            None
-        };
-
-       
-
-        if evicted.is_none() && self.frames.len() >= self.max_pages && !self.frames.contains_key(&page_number) {
-            // If we couldn't evict a page, return the requested page (rejected)
-            return Some((page_number, page));
-            
-        }
-
-        // Create a new frame for this page
-        let mut frame = BufferFrame::new(page);
-
-        // Pin the page if requested
-        if pin {
-            frame.pin();
-            self.stats.pin_operations += 1;
-        } else {
-            // If not pinned, add to LRU list
-            self.lru_list.push_back(page_number);
-        }
-
-        // Add the frame to the buffer pool
-        self.frames.insert(page_number, frame);
-        // println!("Added page {} to buffer pool", page_number);
-        evicted
-    }
 
     /// Smart eviction that considers page access patterns
     fn evict_page_smart(&mut self) -> Option<(u32, Page)> {
@@ -277,40 +322,55 @@ impl BufferPool {
                 self.frames.get(page_number).is_some_and(|frame| !frame.is_pinned())
             })
             .collect();
+       
+        println!("Candidates for eviction: {:?}", candidates);
 
+        if candidates.is_empty() {
+            return None
+        }
+        
         // println!("Candidates for eviction: {:?}", candidates);
         // Sort by last accessed time (oldest first)
         candidates.sort_by_key(|(_, last_accessed,_)| *last_accessed);
-
+        
         if let Some((page_number, _,_)) = candidates.first() {
-            let page_number = *page_number;
+            
+            let page_number =*page_number;
+            
             
             // Remove from LRU list
             self.lru_list.retain(|&p| p != page_number);
-            
+           
             // Remove and return the page
             if let Some(frame) = self.frames.remove(&page_number) {
                 self.stats.pages_evicted += 1;
-                return Some((page_number, frame.page));
+                
+                return Some((page_number, frame.page.clone()));
             }
         }
-
+        None
+        
         // Fallback to original eviction logic
-        self.evict_page_original()
+        //self.evict_page_original()
     }
 
     /// Original eviction logic as fallback
     fn evict_page_original(&mut self) -> Option<(u32, Page)> {
+        
         while let Some(page_number) = self.lru_list.pop_front() {
+            
             if let Some(frame) = self.frames.get(&page_number) {
                 if frame.is_pinned() {
+                    println!("Page {} is pinned, skipping eviction", page_number);
                     self.lru_list.push_back(page_number);
                     continue;
                 }
-
+                
+                
                 if let Some(frame) = self.frames.remove(&page_number) {
                     self.stats.pages_evicted += 1;
-                    return Some((page_number, frame.page));
+                    
+                    return Some((page_number, frame.page.clone()));
                 }
             }
         }
@@ -642,9 +702,12 @@ mod buffer_pool_tests {
         
         // Add page 3, should evict page 2 (least recently used)
         let evicted = pool.add_page(3, page3, false);
-        assert!(evicted.is_some());
-        let (evicted_page_number, _) = evicted.unwrap();
-        assert_eq!(evicted_page_number, 2);
+        match evicted {
+            AddPageResult::Evicted(evicted_page_number, _, _) => {
+                assert_eq!(evicted_page_number, 2);
+            }
+            _ => panic!("Expected page eviction"),
+        }
         
         // Verify stats
         assert_eq!(pool.get_stats().pages_evicted, 1);
