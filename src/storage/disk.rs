@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::header::{self, Header, SQLITE_HEADER_STRING};
+use crate::header::{Header, SQLITE_HEADER_STRING};
 
 /// The `DiskManager` struct is responsible for managing the low-level operations of a SQLite database file.
 /// It provides methods to read and write pages, manage the database header, and allocate new pages as needed.

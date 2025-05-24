@@ -28,6 +28,7 @@ pub const MAX_VARINT_SIZE: usize = 9;
 ///
 /// # Returns
 /// The number of bytes written to the destination.
+#[allow(unused_assignments)]
 pub fn encode_varint<W: Write>(value: i64, writer: &mut W) -> io::Result<usize> {
     let mut uvalue = value as u64;
 

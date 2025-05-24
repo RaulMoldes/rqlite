@@ -5,7 +5,7 @@
 
 //pub mod btree;
 pub mod cell;
-//pub mod node;
+pub mod node;
 pub mod record;
 
 // Re-exportar para facilitar el acceso

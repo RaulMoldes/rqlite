@@ -5,14 +5,12 @@
 //! The Pager ensures that pages are properly managed through RAII guards that automatically
 //! unpin pages when they go out of scope.
 
-use std::cell::{RefCell, Cell};
+
 use std::io;
 use std::path::Path;
-use std::rc::{Rc};
-use std::ops::{Add, Deref, DerefMut};
+use std::ops::{Deref, DerefMut};
 
-use std::sync::{Arc, Weak,};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::cache::{BufferPool, AddPageResult};
 use super::disk::DiskManager;
@@ -214,11 +212,7 @@ impl Pager {
             io::Error::new(io::ErrorKind::Other, format!("Lock poisoned: {}", e))
         })?;
 
-        // Validate page type if specified
-        if let Some(expected) = expected_type {
-            inner.page_cache.validate_page_type(page_number, expected)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        }
+        
        
         // Load page if not in cache
         if !inner.page_cache.contains_page_simple(page_number) {
@@ -229,6 +223,12 @@ impl Pager {
              // Create and return the guard
         
         } 
+
+        // Validate page type if specified
+        if let Some(expected) = expected_type {
+            inner.page_cache.validate_page_type(page_number, expected)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        }
         // Page is already in cache, just pin it
         inner.page_cache.pin_page_for_guard(page_number)?;
         
@@ -415,7 +415,7 @@ impl Pager {
         inner.disk_manager.write_page(page_number, &buffer)?;
 
         // Add to cache
-       // inner.page_cache.add_page(page_number, page, false);
+       inner.page_cache.add_page(page_number, page, false);
 
         Ok(page_number)
     }
@@ -637,12 +637,6 @@ impl Pager {
                     io::ErrorKind::Other,
                     "Buffer pool is full and cannot evict a page",
                 ));
-            },
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Unknown error while adding page to cache",
-                ));
             }
             
         };       
@@ -716,7 +710,7 @@ impl Drop for Pager {
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    use crate::page::{BTreePageHeader, BTreeCell, TableLeafCell};
+    use crate::page::{BTreeCell, TableLeafCell};
 
     #[test]
     fn test_pager_create_and_open() {

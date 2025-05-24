@@ -1,6 +1,3 @@
-use std::cmp::Ordering;
-use std::fmt;
-
 /// Represents a key value extracted from an index node payload.
 /// This enum allows for comparing different types of keys.
 #[derive(Debug, Clone, PartialEq)]

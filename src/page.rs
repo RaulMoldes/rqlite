@@ -449,9 +449,11 @@ impl BTreePage {
     /// Returns an error if the cell cannot be added due to insufficient space or if the cell type is incompatible with the page type.
     /// # Panics
     /// Panics if the cell type is incompatible with the page type.
+    /// # Returns
+    /// Returns the index of the cell in the slot array.
     /// # Notes
     /// The cell is added to the page and the content start offset is updated. T
-    pub fn add_cell(&mut self, cell: BTreeCell) -> io::Result<()> {
+    pub fn add_cell(&mut self, cell: BTreeCell) -> io::Result<u16> {
         // Verify the type compatibility
         // Check if the cell type is compatible with the page type
         match (&self.header.page_type, &cell) {
@@ -509,10 +511,11 @@ impl BTreePage {
         // Append the cell to the cells vector
         self.cells.push(cell);
 
+        
         // Update the first free block offset
         self.header.cell_count += 1;
 
-        Ok(())
+        Ok((self.cell_indices.len() - 1) as u16)
     }
 
     /// Returns the free space on the page .

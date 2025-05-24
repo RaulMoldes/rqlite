@@ -1,6 +1,6 @@
 // Additional improvements to your BufferPool implementation
 
-use crate::page::{self, ByteSerializable, Page, PageType};
+use crate::page::{ByteSerializable, Page, PageType};
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -156,7 +156,7 @@ impl BufferPool {
         if self.frames.len() >= self.max_pages {
             // Try to evict a page
             
-            let evicted = self.evict_page_smart();
+            let evicted = self.evict_page();
             
             match evicted {
                 Some((evicted_num, evicted_page)) => {
@@ -309,7 +309,7 @@ impl BufferPool {
 
 
     /// Smart eviction that considers page access patterns
-    fn evict_page_smart(&mut self) -> Option<(u32, Page)> {
+    fn evict_page(&mut self) -> Option<(u32, Page)> {
         // println!("Evicting page using smart eviction strategy");
         // println!("Frames before eviction: {:?}", self.frames);
         // First, try to find the least recently used unpinned page
@@ -354,28 +354,6 @@ impl BufferPool {
         //self.evict_page_original()
     }
 
-    /// Original eviction logic as fallback
-    fn evict_page_original(&mut self) -> Option<(u32, Page)> {
-        
-        while let Some(page_number) = self.lru_list.pop_front() {
-            
-            if let Some(frame) = self.frames.get(&page_number) {
-                if frame.is_pinned() {
-                    println!("Page {} is pinned, skipping eviction", page_number);
-                    self.lru_list.push_back(page_number);
-                    continue;
-                }
-                
-                
-                if let Some(frame) = self.frames.remove(&page_number) {
-                    self.stats.pages_evicted += 1;
-                    
-                    return Some((page_number, frame.page.clone()));
-                }
-            }
-        }
-        None
-    }
 
     /// Enhanced mark_dirty with validation
     pub fn mark_dirty(&mut self, page_number: u32) -> bool {

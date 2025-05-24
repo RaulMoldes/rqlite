@@ -257,10 +257,7 @@ impl BTreeCellFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::page::{
-        BTreeCell, IndexInteriorCell, IndexLeafCell, TableInteriorCell, TableLeafCell,
-    };
-
+    use crate::page::BTreeCell;
     // Test helper function to create a simple payload
     fn create_test_payload(size: usize) -> Vec<u8> {
         (0..size).map(|i| (i % 256) as u8).collect()
